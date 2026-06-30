@@ -1,0 +1,10 @@
+.env
+service_account.json
+yc_authorized_key.json
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.db
+*.db-journal
