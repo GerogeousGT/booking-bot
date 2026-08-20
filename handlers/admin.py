@@ -17,7 +17,7 @@ from aiogram.types import (
 
 from config import ADMIN_TELEGRAM_ID, TIMEZONE, SLOT_DURATION_MIN
 from database import (
-    create_booking, get_booking, get_client, get_client_meet_url, get_recent_clients,
+    create_booking, get_booking, get_bookable_people, get_client_meet_url, get_person,
     get_upcoming_bookings, set_booking_meet_url, set_client_meet_url, upsert_client,
     get_pending_custom, delete_pending_custom,
 )
@@ -251,21 +251,28 @@ async def cmd_add(message: Message, state: FSMContext):
     if message.from_user.id != ADMIN_TELEGRAM_ID:
         return
 
-    clients = await get_recent_clients()
-    if not clients:
+    people = await get_bookable_people()
+    if not people:
         await message.answer(
-            "Пока некого записывать — в базе нет клиентов.\n\n"
-            "Записать можно только того, кто хоть раз писал боту: Telegram не даёт "
-            "боту найти человека по @username и не даёт написать первым."
+            "Пока некого записывать.\n\n"
+            "Записать можно только того, кто хоть раз писал боту и дал согласие на "
+            "обработку данных: Telegram не даёт боту найти человека по @username "
+            "и не даёт написать первым."
         )
         return
 
+    # Пометка отделяет тех, у кого уже были записи, от тех, кто только стартовал бота
     rows = [
-        [InlineKeyboardButton(text=f"{c['name']} ({c['contact']})",
-                              callback_data=f"addcl:{c['telegram_id']}")]
-        for c in clients
+        [InlineKeyboardButton(
+            text=("👤 " if p["is_client"] else "🆕 ") + f"{p['name']} ({p['contact']})",
+            callback_data=f"addcl:{p['telegram_id']}",
+        )]
+        for p in people
     ]
-    await message.answer("Кого записываем?", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await message.answer(
+        "Кого записываем?\n👤 — уже были записи, 🆕 — стартовал бота, но не записывался",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
 
 
 @router.callback_query(F.data.startswith("addcl:"))
@@ -275,17 +282,20 @@ async def handle_add_client(callback: CallbackQuery, state: FSMContext):
         return
 
     client_id = int(callback.data.split(":", 1)[1])
-    client = await get_client(client_id)
-    if not client:
-        await callback.message.answer("Клиент не найден.")
+    person = await get_person(client_id)
+    if not person:
+        await callback.message.answer("Человек не найден в базе.")
         await callback.answer()
         return
 
     await callback.message.edit_reply_markup(reply_markup=None)
     await state.update_data(
-        client_id=client_id, name=client["name"], contact=client["contact"], pending_id=None
+        client_id=client_id, name=person["name"], contact=person["contact"], pending_id=None
     )
-    await _ask_admin_for_time(callback.message, state, hint=f"Записываем: {client['name']}")
+    await _ask_admin_for_time(
+        callback.message, state,
+        hint=f"Записываем: {person['name']} ({person['contact']})",
+    )
     await callback.answer()
 
 

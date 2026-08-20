@@ -16,7 +16,7 @@ from aiogram.types import (
 )
 
 from config import ADMIN_TELEGRAM_ID, MIN_HOURS_BEFORE, SLOTS_DAYS_AHEAD, TIMEZONE
-from database import create_booking, get_booking, get_user_bookings, cancel_booking, get_client, get_client_meet_url, upsert_client, save_consent, delete_client, has_consent, create_pending_custom
+from database import create_booking, get_booking, get_user_bookings, cancel_booking, get_client, get_client_meet_url, upsert_client, upsert_known_user, save_consent, delete_client, has_consent, create_pending_custom
 from services.calendar_service import create_event, delete_event, get_busy_slots
 from services.date_parser import LLMUnavailable, is_outside_work_hours, parse_user_input
 from services.availability import find_free_slots, find_nearest_free_slots, is_slot_free
@@ -119,6 +119,19 @@ async def _show_nearest_slots(message: Message, state: FSMContext, intro: str) -
     await state.set_state(BookingState.waiting_for_slot_choice)
 
 
+async def _remember_user(user) -> None:
+    """Запоминает любого, кто коснулся бота.
+
+    Без этого человек попадал в базу только после доведённой до конца записи —
+    и психолог не мог записать его сам через /add, хотя тот уже стартовал бота."""
+    await upsert_known_user(
+        telegram_id=user.id,
+        username=user.username or "",
+        first_name=user.first_name or "",
+        seen_at=datetime.now(MOSCOW_TZ).isoformat(),
+    )
+
+
 # ─────────────────────── /start ────────────────────────
 
 CONSENT_KB = InlineKeyboardMarkup(inline_keyboard=[
@@ -130,6 +143,7 @@ CONSENT_KB = InlineKeyboardMarkup(inline_keyboard=[
 @router.message(F.text == "/start")
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
+    await _remember_user(message.from_user)
     if await has_consent(message.from_user.id):
         await message.answer(
             "Привет! Я помогу записаться на консультацию.",
@@ -156,6 +170,7 @@ async def handle_consent_screen(callback: CallbackQuery, state: FSMContext):
 
     # agree
     now = datetime.now(MOSCOW_TZ)
+    await _remember_user(callback.from_user)
     await save_consent(callback.from_user.id, now.isoformat())
     await callback.message.edit_reply_markup(reply_markup=None)
     await callback.message.answer(

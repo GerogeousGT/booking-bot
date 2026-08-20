@@ -37,6 +37,17 @@ async def init_db() -> None:
                 reminder_5min_sent INTEGER NOT NULL DEFAULT 0
             )
         """)
+        # Все, кто хоть раз коснулся бота. Отдельно от clients: туда человек попадает
+        # только когда доведёт запись до конца, а записать его самому психологу может
+        # понадобиться раньше — и тогда его просто не видно в /add.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS known_users (
+                telegram_id INTEGER PRIMARY KEY,
+                username    TEXT,
+                first_name  TEXT,
+                seen_at     TEXT NOT NULL
+            )
+        """)
         # Колонки, добавленные после первого релиза. CREATE TABLE IF NOT EXISTS их
         # в живую базу не принесёт, поэтому догоняем через ALTER — идемпотентно.
         await _ensure_column(db, "bookings", "admin_link_prompt_sent", "INTEGER NOT NULL DEFAULT 0")
@@ -176,17 +187,90 @@ async def get_client(telegram_id: int):
             return await cur.fetchone()
 
 
-async def get_recent_clients(limit: int = 8):
-    """Клиенты, которых психолог может записать сам.
+async def upsert_known_user(telegram_id: int, username: str, first_name: str, seen_at: str):
+    """Запоминает всех, кто коснулся бота — при /start и при согласии.
 
-    Только те, кто писал боту: Bot API не умеет искать пользователя по @username,
-    поэтому записать можно лишь того, чей telegram_id у нас уже есть."""
+    username обновляем на каждом касании: люди их меняют, а список в /add должен
+    показывать актуальное."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT INTO known_users (telegram_id, username, first_name, seen_at)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(telegram_id) DO UPDATE SET
+                 username=excluded.username,
+                 first_name=excluded.first_name,
+                 seen_at=excluded.seen_at""",
+            (telegram_id, username or "", first_name or "", seen_at),
+        )
+        await db.commit()
+
+
+async def get_bookable_people(limit: int = 20) -> list[dict]:
+    """Кого психолог может записать сам.
+
+    Только те, кто писал боту (Bot API не ищет по @username и не даёт написать
+    первым) и дал согласие на обработку данных. Сначала те, у кого уже были записи,
+    ниже — остальные, кто дошёл только до согласия."""
+    people: list[dict] = []
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+
+        async with db.execute(
+            """SELECT c.* FROM clients c
+               JOIN consents s ON s.telegram_id = c.telegram_id
+               ORDER BY c.updated_at DESC"""
+        ) as cur:
+            for row in await cur.fetchall():
+                people.append({
+                    "telegram_id": row["telegram_id"],
+                    "name": row["name"],
+                    "contact": row["contact"],
+                    "is_client": True,
+                })
+
+        async with db.execute(
+            """SELECT k.* FROM known_users k
+               JOIN consents s ON s.telegram_id = k.telegram_id
+               WHERE k.telegram_id NOT IN (SELECT telegram_id FROM clients)
+               ORDER BY k.seen_at DESC"""
+        ) as cur:
+            for row in await cur.fetchall():
+                username = row["username"] or ""
+                people.append({
+                    "telegram_id": row["telegram_id"],
+                    "name": row["first_name"] or "Без имени",
+                    "contact": f"@{username}" if username else f"id:{row['telegram_id']}",
+                    "is_client": False,
+                })
+
+    return people[:limit]
+
+
+async def get_person(telegram_id: int) -> dict | None:
+    """Данные для записи: сначала как клиента, иначе как просто знакомого боту."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT * FROM clients ORDER BY updated_at DESC LIMIT ?", (limit,)
+            "SELECT * FROM clients WHERE telegram_id = ?", (telegram_id,)
         ) as cur:
-            return await cur.fetchall()
+            row = await cur.fetchone()
+        if row:
+            return {"telegram_id": telegram_id, "name": row["name"],
+                    "contact": row["contact"], "is_client": True}
+
+        async with db.execute(
+            "SELECT * FROM known_users WHERE telegram_id = ?", (telegram_id,)
+        ) as cur:
+            row = await cur.fetchone()
+    if not row:
+        return None
+    username = row["username"] or ""
+    return {
+        "telegram_id": telegram_id,
+        "name": row["first_name"] or "Без имени",
+        "contact": f"@{username}" if username else f"id:{telegram_id}",
+        "is_client": False,
+    }
 
 
 async def upsert_client(telegram_id: int, name: str, contact: str, updated_at: str):
