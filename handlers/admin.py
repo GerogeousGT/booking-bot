@@ -17,12 +17,13 @@ from aiogram.types import (
 
 from config import ADMIN_TELEGRAM_ID, TIMEZONE, SLOT_DURATION_MIN
 from database import (
-    create_booking, get_booking, get_client_meet_url, get_upcoming_bookings,
-    set_booking_meet_url, set_client_meet_url, upsert_client,
+    create_booking, get_booking, get_client, get_client_meet_url, get_recent_clients,
+    get_upcoming_bookings, set_booking_meet_url, set_client_meet_url, upsert_client,
     get_pending_custom, delete_pending_custom,
 )
+from services.availability import find_free_slots, find_nearest_free_slots, is_slot_free
 from services.calendar_service import create_event, set_event_meet_url
-from services.date_parser import parse_user_input
+from services.date_parser import LLMUnavailable, is_outside_work_hours, parse_user_input
 
 router = Router()
 logger = logging.getLogger(__name__)
@@ -207,6 +208,280 @@ async def _deliver_link(bot: Bot, telegram_id: int, slot_start: datetime,
         return False
 
 
+# ─────────────────────── запись, которую делает психолог ────────────────────────
+#
+# Одно ядро на два входа: команда /add и кнопка «Записать на другое время» на
+# карточке нестандартного запроса. Смысл — чтобы любая договорённость шла через
+# бота и попадала в календарь, а не жила отдельно в голове и в ручной записи.
+#
+# Записать можно только того, чей telegram_id у нас есть (человек писал боту):
+# Bot API не умеет искать пользователя по @username и не даёт написать первым.
+
+MAX_ADMIN_SLOTS = 6
+
+
+class AdminBookState(StatesGroup):
+    waiting_for_time = State()
+    waiting_for_slot = State()
+
+
+def _admin_slots_keyboard(slots: list[datetime], note: str = "") -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=(note or "") + fmt_slot(s),
+                              callback_data=f"addslot:{s.isoformat()}")]
+        for s in slots
+    ]
+    rows.append([InlineKeyboardButton(text="↩ Другое время", callback_data="addslot:other")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _ask_admin_for_time(message: Message, state: FSMContext, hint: str = "") -> None:
+    await state.set_state(AdminBookState.waiting_for_time)
+    await message.answer(
+        (hint + "\n\n" if hint else "")
+        + "На какое время записываем?\n"
+        "Пиши свободно: «завтра в 15», «в субботу в 19:00», «в пятницу утром».\n"
+        "Вне рабочих часов и в выходные — тоже можно, предупрежу.\n\n"
+        "Отменить — /cancel"
+    )
+
+
+@router.message(F.text == "/add")
+async def cmd_add(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_TELEGRAM_ID:
+        return
+
+    clients = await get_recent_clients()
+    if not clients:
+        await message.answer(
+            "Пока некого записывать — в базе нет клиентов.\n\n"
+            "Записать можно только того, кто хоть раз писал боту: Telegram не даёт "
+            "боту найти человека по @username и не даёт написать первым."
+        )
+        return
+
+    rows = [
+        [InlineKeyboardButton(text=f"{c['name']} ({c['contact']})",
+                              callback_data=f"addcl:{c['telegram_id']}")]
+        for c in clients
+    ]
+    await message.answer("Кого записываем?", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.callback_query(F.data.startswith("addcl:"))
+async def handle_add_client(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_TELEGRAM_ID:
+        await callback.answer()
+        return
+
+    client_id = int(callback.data.split(":", 1)[1])
+    client = await get_client(client_id)
+    if not client:
+        await callback.message.answer("Клиент не найден.")
+        await callback.answer()
+        return
+
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await state.update_data(
+        client_id=client_id, name=client["name"], contact=client["contact"], pending_id=None
+    )
+    await _ask_admin_for_time(callback.message, state, hint=f"Записываем: {client['name']}")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("cother:"))
+async def handle_custom_other_time(callback: CallbackQuery, state: FSMContext):
+    """Вход из карточки нестандартного запроса: договорились на другое время."""
+    if callback.from_user.id != ADMIN_TELEGRAM_ID:
+        await callback.answer()
+        return
+
+    pending_id = int(callback.data.split(":", 1)[1])
+    pending = await get_pending_custom(pending_id)
+    if not pending:
+        await callback.answer("Запрос не найден — возможно уже обработан.", show_alert=True)
+        return
+
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await state.update_data(
+        client_id=pending["telegram_id"], name=pending["name"],
+        contact=pending["contact"], pending_id=pending_id,
+    )
+    await _ask_admin_for_time(
+        callback.message, state,
+        hint=f"Записываем: {pending['name']}\nПросил(а): {pending['custom_request']}",
+    )
+    await callback.answer()
+
+
+@router.message(AdminBookState.waiting_for_time, F.text.in_({"/cancel", "отмена", "Отмена"}))
+async def handle_admin_book_cancel(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Отменил. Запись не создана.")
+
+
+@router.message(AdminBookState.waiting_for_time)
+async def handle_admin_time(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+
+    try:
+        result = parse_user_input(text, user_id=message.from_user.id)
+    except LLMUnavailable as e:
+        logger.error(f"LLM недоступен при админской записи: {e}")
+        result = None
+
+    if result is None:
+        slots = find_nearest_free_slots(MAX_ADMIN_SLOTS)
+        if not slots:
+            await message.answer("Не понял время, и свободных слотов рядом нет. Напиши иначе.")
+            return
+        await state.set_state(AdminBookState.waiting_for_slot)
+        await message.answer("Не понял время. Ближайшие свободные:",
+                             reply_markup=_admin_slots_keyboard(slots))
+        return
+
+    parsed_dt = result["dt"]
+    period = result["period"]
+
+    # Точное время: психолог мог договориться на выходной или на вечер — для него
+    # сетка рабочих часов не ограничение, в отличие от самозаписи клиента
+    exact = parsed_dt.hour != 0 and not result["date_range"]
+    if exact:
+        try:
+            free = is_slot_free(parsed_dt)
+        except Exception as e:
+            logger.error(f"Ошибка Calendar API: {e}")
+            await message.answer("Не удалось проверить календарь. Попробуй ещё раз.")
+            return
+
+        if not free:
+            slots = find_free_slots(parsed_dt, None)[:MAX_ADMIN_SLOTS]
+            await state.set_state(AdminBookState.waiting_for_slot)
+            await message.answer(
+                f"{fmt_slot(parsed_dt)} — занято." +
+                ("\n\nСвободное в этот день:" if slots else "\n\nВ этот день свободного нет."),
+                reply_markup=_admin_slots_keyboard(slots),
+            )
+            return
+
+        note = "⚠️ вне расписания: " if is_outside_work_hours(parsed_dt, period) else ""
+        await state.set_state(AdminBookState.waiting_for_slot)
+        await message.answer("Подтверди время:", reply_markup=_admin_slots_keyboard([parsed_dt], note))
+        return
+
+    try:
+        slots = find_free_slots(parsed_dt, period)[:MAX_ADMIN_SLOTS]
+    except Exception as e:
+        logger.error(f"Ошибка Calendar API: {e}")
+        await message.answer("Не удалось загрузить расписание. Попробуй ещё раз.")
+        return
+
+    if not slots:
+        await message.answer("В это время свободного нет. Назови другое время или точный час.")
+        return
+
+    await state.set_state(AdminBookState.waiting_for_slot)
+    await message.answer("Выбери слот:", reply_markup=_admin_slots_keyboard(slots))
+
+
+@router.callback_query(AdminBookState.waiting_for_slot, F.data.startswith("addslot:"))
+async def handle_admin_slot(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    value = callback.data[len("addslot:"):]
+    await callback.message.edit_reply_markup(reply_markup=None)
+
+    if value == "other":
+        await _ask_admin_for_time(callback.message, state)
+        await callback.answer()
+        return
+
+    slot_start = datetime.fromisoformat(value)
+    data = await state.get_data()
+    await state.clear()
+
+    try:
+        if not is_slot_free(slot_start):
+            await callback.message.answer("Это время только что заняли. Начни заново: /add")
+            await callback.answer()
+            return
+    except Exception as e:
+        logger.warning(f"Не удалось проверить занятость перед созданием: {e}")
+
+    await _create_booking_by_admin(
+        bot=bot,
+        admin_message=callback.message,
+        client_id=data["client_id"],
+        name=data["name"],
+        contact=data["contact"],
+        slot_start=slot_start,
+        pending_id=data.get("pending_id"),
+    )
+    await callback.answer()
+
+
+async def _create_booking_by_admin(bot: Bot, admin_message: Message, client_id: int,
+                                   name: str, contact: str, slot_start: datetime,
+                                   pending_id: int | None) -> None:
+    """Ядро: создаёт запись от лица психолога и уведомляет клиента.
+
+    Общее для /add и для карточки нестандартного запроса — чтобы договорённость
+    в любом случае попала в календарь и получила напоминания."""
+    slot_end = slot_start + timedelta(minutes=SLOT_DURATION_MIN)
+    meet_url = await get_client_meet_url(client_id)
+
+    try:
+        event_id = create_event(name, contact, slot_start, slot_end, meet_url)
+    except Exception as e:
+        logger.error(f"Ошибка создания события: {e}")
+        await admin_message.answer(f"Ошибка при создании события в Calendar: {e}")
+        return
+
+    now = datetime.now(MOSCOW_TZ)
+    booking_id = await create_booking(
+        telegram_id=client_id, name=name, contact=contact,
+        slot_start=slot_start.isoformat(), slot_end=slot_end.isoformat(),
+        google_event_id=event_id, meet_url=meet_url, created_at=now.isoformat(),
+    )
+    await upsert_client(client_id, name, contact, now.isoformat())
+    if pending_id:
+        await delete_pending_custom(pending_id)
+
+    link_line = (
+        f"Подключайтесь по ссылке к началу:\n{meet_url}\n\n" if meet_url
+        else "Ссылку на видеовстречу пришлю сюда за 10–15 минут до начала.\n\n"
+    )
+    delivered = await _notify_client(
+        bot, client_id,
+        f"✅ Вы записаны на консультацию\n\n"
+        f"Время: {fmt_slot(slot_start)}\n"
+        f"{link_line}"
+        f"Пришлю напоминание за сутки и за час до начала.\n"
+        f"Чтобы отменить — /cancel",
+    )
+
+    status = "уведомление отправлено" if delivered else "⚠️ клиент недоступен (мог заблокировать бота)"
+    await admin_message.answer(
+        f"✅ Запись создана #{booking_id}\n"
+        f"Клиент: {name} ({contact})\n"
+        f"Время: {fmt_slot(slot_start)}\n"
+        f"{status}"
+        + ("" if meet_url else "\n\nСсылки у клиента ещё нет — можно приложить сразу:"),
+        reply_markup=link_actions_keyboard(booking_id, bool(meet_url)),
+    )
+
+
+async def _notify_client(bot: Bot, client_id: int, text: str) -> bool:
+    """Пишет клиенту. False — не дошло (заблокировал бота и т.п.).
+
+    Бот не может написать первым, но клиент, который однажды стартовал бота, всё
+    ещё может его заблокировать — тогда психолог должен об этом узнать, а не гадать."""
+    try:
+        await bot.send_message(chat_id=client_id, text=text)
+        return True
+    except Exception as e:
+        logger.error(f"Не удалось уведомить клиента {client_id}: {e}")
+        return False
+
+
 # ─────────────────────── /bookings ────────────────────────
 
 @router.message(F.text == "/bookings")
@@ -230,7 +505,12 @@ async def cmd_bookings(message: Message):
 # ─────────────────────── нестандартное время ────────────────────────
 
 @router.callback_query(F.data.startswith("ca:"))
-async def handle_custom_accept(callback: CallbackQuery, bot: Bot):
+async def handle_custom_accept(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    """Принять нестандартный запрос как есть — на то время, которое просил клиент."""
+    if callback.from_user.id != ADMIN_TELEGRAM_ID:
+        await callback.answer()
+        return
+
     pending_id = int(callback.data.split(":")[1])
     pending = await get_pending_custom(pending_id)
 
@@ -238,78 +518,56 @@ async def handle_custom_accept(callback: CallbackQuery, bot: Bot):
         await callback.answer("Запрос не найден — возможно уже обработан.", show_alert=True)
         return
 
-    client_id = pending["telegram_id"]
-    name = pending["name"]
-    contact = pending["contact"]
-    requested_dt_iso = pending["requested_dt"]
-
     await callback.message.edit_reply_markup(reply_markup=None)
+    await state.update_data(
+        client_id=pending["telegram_id"], name=pending["name"],
+        contact=pending["contact"], pending_id=pending_id,
+    )
 
-    # Определяем время записи из запроса клиента
+    # Время из запроса клиента. Раньше при неопределённом часе молча подставлялось
+    # 10:00 — клиент просил «в субботу вечером», а получал подтверждение на утро.
+    # Теперь спрашиваем, а не угадываем.
     try:
-        slot_start = datetime.fromisoformat(requested_dt_iso).astimezone(MOSCOW_TZ)
-        # Если время не указано (час = 0) — ставим 10:00 как дефолт
-        if slot_start.hour == 0:
-            slot_start = slot_start.replace(hour=10, minute=0)
+        slot_start = datetime.fromisoformat(pending["requested_dt"]).astimezone(MOSCOW_TZ)
     except Exception:
-        await callback.message.answer(
-            f"Не смог определить время из запроса клиента.\n"
-            f"Запрос: {pending['custom_request']}\n\n"
-            f"Свяжитесь с клиентом напрямую: {contact}"
+        await _ask_admin_for_time(
+            callback.message, state,
+            hint=f"Не смог определить время из запроса: «{pending['custom_request']}»",
         )
-        await delete_pending_custom(pending_id)
         await callback.answer()
         return
 
-    slot_end = slot_start + timedelta(minutes=SLOT_DURATION_MIN)
-    # Постоянная ссылка клиента, если он у нас уже был; иначе пусто — запросим позже
-    meet_url = await get_client_meet_url(client_id)
+    if slot_start.hour == 0:
+        await _ask_admin_for_time(
+            callback.message, state,
+            hint=(f"Клиент назвал день, но не час: «{pending['custom_request']}»\n"
+                  f"Дата: {slot_start.strftime('%d.%m')}"),
+        )
+        await callback.answer()
+        return
 
+    # Раньше проверки не было — два нестандартных запроса могли лечь на один час
     try:
-        event_id = create_event(name, contact, slot_start, slot_end, meet_url)
+        if not is_slot_free(slot_start):
+            slots = find_free_slots(slot_start, None)[:MAX_ADMIN_SLOTS]
+            await state.set_state(AdminBookState.waiting_for_slot)
+            await callback.message.answer(
+                f"{fmt_slot(slot_start)} уже занято." +
+                ("\n\nСвободное в этот день:" if slots else "\n\nВ этот день свободного нет."),
+                reply_markup=_admin_slots_keyboard(slots),
+            )
+            await callback.answer()
+            return
     except Exception as e:
-        await callback.message.answer(f"Ошибка создания события в Calendar: {e}")
-        await callback.answer()
-        return
+        logger.warning(f"Не удалось проверить занятость: {e}")
 
-    now = datetime.now(MOSCOW_TZ)
-    booking_id = await create_booking(
-        telegram_id=client_id,
-        name=name,
-        contact=contact,
-        slot_start=slot_start.isoformat(),
-        slot_end=slot_end.isoformat(),
-        google_event_id=event_id,
-        meet_url=meet_url,
-        created_at=now.isoformat(),
-    )
-    await upsert_client(client_id, name, contact, now.isoformat())
-    await delete_pending_custom(pending_id)
-
-    await callback.message.answer(
-        f"✅ Запись создана #{booking_id}\n"
-        f"Клиент: {name} ({contact})\n"
-        f"Время: {fmt_slot(slot_start)}\n"
-        + (f"Ссылка: {meet_url} (сохранённая, отправлена клиенту)"
-           if meet_url else "⚠️ Ссылки нет — попрошу прислать перед встречей")
-    )
-
-    link_line = (
-        f"Ссылка для подключения:\n{meet_url}\n\n" if meet_url
-        else "Ссылку на видеовстречу пришлю сюда за 10–15 минут до начала.\n\n"
-    )
-    await bot.send_message(
-        chat_id=client_id,
-        text=(
-            f"✅ Ваша запись подтверждена!\n\n"
-            f"Время: {fmt_slot(slot_start)}\n"
-            f"{link_line}"
-            f"Пришлю напоминание за час и за 5 минут до начала.\n"
-            f"Чтобы отменить — /cancel"
-        ),
+    await state.clear()
+    await _create_booking_by_admin(
+        bot=bot, admin_message=callback.message,
+        client_id=pending["telegram_id"], name=pending["name"],
+        contact=pending["contact"], slot_start=slot_start, pending_id=pending_id,
     )
     await callback.answer()
-
 
 @router.callback_query(F.data.startswith("cd:"))
 async def handle_custom_decline(callback: CallbackQuery, bot: Bot):
@@ -323,15 +581,20 @@ async def handle_custom_decline(callback: CallbackQuery, bot: Bot):
     await callback.message.answer("Запрос отклонён. Свяжитесь с клиентом напрямую.")
 
     if client_id:
-        await bot.send_message(
-            chat_id=client_id,
-            text=(
-                f"К сожалению, запрошенное время недоступно.\n\n"
-                f"Георгий свяжется с вами в ближайшее время, чтобы согласовать удобный вариант.\n\n"
-                f"Если хотите выбрать время самостоятельно — нажмите «Записаться» в меню."
-            ),
+        delivered = await _notify_client(
+            bot, client_id,
+            "К сожалению, запрошенное время недоступно.\n\n"
+            "Георгий свяжется с вами в ближайшее время, чтобы согласовать удобный вариант.\n\n"
+            "Если хотите выбрать время самостоятельно — нажмите «Записаться» в меню.",
         )
+        if not delivered:
+            await callback.message.answer(
+                f"⚠️ Уведомление до клиента не дошло (мог заблокировать бота). "
+                f"Свяжись напрямую: {pending['contact'] if pending else name}"
+            )
 
+    # Удаляем заявку в любом случае: раньше падение отправки клиенту обрывало
+    # хендлер здесь, заявка зависала в базе и кнопки жались повторно
     if pending:
         await delete_pending_custom(pending_id)
 

@@ -19,6 +19,7 @@ from config import ADMIN_TELEGRAM_ID, MIN_HOURS_BEFORE, SLOTS_DAYS_AHEAD, TIMEZO
 from database import create_booking, get_booking, get_user_bookings, cancel_booking, get_client, get_client_meet_url, upsert_client, save_consent, delete_client, has_consent, create_pending_custom
 from services.calendar_service import create_event, delete_event, get_busy_slots
 from services.date_parser import LLMUnavailable, is_outside_work_hours, parse_user_input
+from services.availability import find_free_slots, find_nearest_free_slots, is_slot_free
 from services.notifier import notify_admin_error
 from services.slot_finder import (
     SLOT_DURATION, build_search_range, filter_free_slots, generate_candidate_slots,
@@ -83,21 +84,11 @@ def slots_keyboard(slots: list[datetime]) -> InlineKeyboardMarkup:
 
 
 async def _find_slots(parsed_dt: datetime, period) -> list[datetime]:
-    now = datetime.now(MOSCOW_TZ)
-    search_start, search_end = build_search_range(parsed_dt, period)
-    busy = get_busy_slots(search_start, search_end + timedelta(hours=1))
-    candidates = generate_candidate_slots(search_start, search_end, period)
-    return filter_free_slots(candidates, busy)
+    return find_free_slots(parsed_dt, period)
 
 
 async def _find_nearest_slots(limit: int = MAX_SLOTS_SHOWN) -> list[datetime]:
-    """Ближайшие свободные слоты на весь горизонт записи, без привязки к дню."""
-    now = datetime.now(MOSCOW_TZ)
-    busy = get_busy_slots(now, now + timedelta(days=SLOTS_DAYS_AHEAD))
-    candidates = generate_candidate_slots(
-        now + timedelta(hours=MIN_HOURS_BEFORE), now + timedelta(days=SLOTS_DAYS_AHEAD)
-    )
-    return filter_free_slots(candidates, busy)[:limit]
+    return find_nearest_free_slots(limit)
 
 
 # Запасной выход, когда разобрать текст не получилось: не выкидываем клиента из
@@ -712,10 +703,13 @@ async def handle_confirm(message: Message, state: FSMContext, bot: Bot):
             custom_request=custom_request,
         )
 
-        admin_kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="✅ Принять", callback_data=f"ca:{pending_id}"),
-            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"cd:{pending_id}"),
-        ]])
+        admin_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Принять как есть", callback_data=f"ca:{pending_id}")],
+            # Договорились голосом на другое время — проводим запись через бота,
+            # чтобы она попала в календарь и получила напоминания со ссылкой
+            [InlineKeyboardButton(text="📝 Записать на другое время", callback_data=f"cother:{pending_id}")],
+            [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"cd:{pending_id}")],
+        ])
         tg_link = f"@{message.from_user.username}" if message.from_user.username else f"id:{message.from_user.id}"
         await bot.send_message(
             chat_id=ADMIN_TELEGRAM_ID,
@@ -740,8 +734,7 @@ async def handle_confirm(message: Message, state: FSMContext, bot: Bot):
 
     # финальная проверка на race condition
     try:
-        busy = get_busy_slots(slot_start, slot_end + timedelta(minutes=1))
-        if not filter_free_slots([slot_start], busy):
+        if not is_slot_free(slot_start):
             await message.answer(
                 "Этот слот только что заняли. Выберите другое время:"
             )

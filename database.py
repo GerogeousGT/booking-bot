@@ -176,6 +176,19 @@ async def get_client(telegram_id: int):
             return await cur.fetchone()
 
 
+async def get_recent_clients(limit: int = 8):
+    """Клиенты, которых психолог может записать сам.
+
+    Только те, кто писал боту: Bot API не умеет искать пользователя по @username,
+    поэтому записать можно лишь того, чей telegram_id у нас уже есть."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM clients ORDER BY updated_at DESC LIMIT ?", (limit,)
+        ) as cur:
+            return await cur.fetchall()
+
+
 async def upsert_client(telegram_id: int, name: str, contact: str, updated_at: str):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
