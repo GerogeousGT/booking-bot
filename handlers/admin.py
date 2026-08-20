@@ -24,6 +24,8 @@ from database import (
 from services.availability import find_free_slots, find_nearest_free_slots, is_slot_free
 from services.calendar_service import create_event, set_event_meet_url
 from services.date_parser import LLMUnavailable, is_outside_work_hours, parse_user_input
+# Клавиатура ссылки живёт в notifier: одни и те же кнопки в /link и в напоминании
+from services.notifier import link_actions_keyboard
 
 router = Router()
 logger = logging.getLogger(__name__)
@@ -53,18 +55,6 @@ class AdminLinkState(StatesGroup):
 def _extract_url(text: str) -> str | None:
     m = _URL_RE.search(text or "")
     return m.group(0).rstrip(".,;)»\"'") if m else None
-
-
-def link_actions_keyboard(booking_id: int, has_link: bool) -> InlineKeyboardMarkup:
-    if has_link:
-        rows = [
-            [InlineKeyboardButton(text="📤 Прислать повторно", callback_data=f"resend:{booking_id}")],
-            [InlineKeyboardButton(text="🔄 Заменить ссылку", callback_data=f"relink:{booking_id}")],
-        ]
-    else:
-        rows = [[InlineKeyboardButton(text="📎 Отправить ссылку",
-                                      callback_data=f"sendlink:{booking_id}")]]
-    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 @router.message(F.text == "/link")

@@ -137,20 +137,6 @@ async def get_client_meet_url(telegram_id: int) -> str:
     return (row[0] or "") if row else ""
 
 
-async def get_bookings_needing_link():
-    """Будущие записи без ссылки — по ним психологу надо напомнить."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(
-            """SELECT * FROM bookings
-               WHERE status = 'confirmed'
-               AND slot_start > datetime('now')
-               AND (meet_url IS NULL OR meet_url = '')
-               ORDER BY slot_start"""
-        ) as cur:
-            return await cur.fetchall()
-
-
 async def mark_link_prompt_sent(booking_id: int, kind: str):
     field = {"prompt": "admin_link_prompt_sent", "retry": "admin_link_retry_sent"}.get(
         kind, "admin_link_prompt_sent"

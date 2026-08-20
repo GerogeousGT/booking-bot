@@ -79,16 +79,18 @@ def test_client_link_is_reused(tmp_path, monkeypatch):
             google_event_id="ev1", meet_url="", created_at=now.isoformat(),
         )
 
-        # без ссылки запись попадает в очередь на запрос психологу
-        pending = await database.get_bookings_needing_link()
-        assert [b["id"] for b in pending] == [booking_id]
+        # без ссылки психолог получит запрос прислать её
+        upcoming = await database.get_upcoming_bookings()
+        assert [b["id"] for b in upcoming] == [booking_id]
+        assert not upcoming[0]["meet_url"]
 
         url = "https://vk.com/call/join/abc-123"
         await database.set_booking_meet_url(booking_id, url)
         await database.set_client_meet_url(111, url)
 
-        # запрос психологу по ней больше не нужен
-        assert await database.get_bookings_needing_link() == []
+        # запрос прислать ссылку по ней больше не нужен
+        upcoming = await database.get_upcoming_bookings()
+        assert upcoming[0]["meet_url"] == url
         # а следующая запись этого клиента подставит ссылку сама
         assert await database.get_client_meet_url(111) == url
 
@@ -146,11 +148,12 @@ class _FakeBot:
         self.sent.append({"chat_id": chat_id, "text": text, "markup": reply_markup})
 
 
-def _booking_row(minutes_left: int, prompt_sent=0, retry_sent=0, booking_id=1):
+def _booking_row(minutes_left: int, prompt_sent=0, retry_sent=0, booking_id=1, meet_url=""):
     slot_start = datetime.now(MOSCOW_TZ) + timedelta(minutes=minutes_left)
     return {
         "id": booking_id, "name": "Тест", "telegram_id": 111,
         "slot_start": slot_start.isoformat(),
+        "meet_url": meet_url,
         "admin_link_prompt_sent": prompt_sent,
         "admin_link_retry_sent": retry_sent,
     }
@@ -166,12 +169,12 @@ def _run_check(monkeypatch, rows):
     async def fake_mark(booking_id, kind):
         marked.append((booking_id, kind))
 
-    monkeypatch.setattr(notifier, "get_bookings_needing_link", fake_needing_link)
+    monkeypatch.setattr(notifier, "get_upcoming_bookings", fake_needing_link)
     monkeypatch.setattr(notifier, "mark_link_prompt_sent", fake_mark)
     monkeypatch.setattr(notifier, "ADMIN_TELEGRAM_ID", 999)
 
     bot = _FakeBot()
-    asyncio.run(notifier._check_missing_links(bot))
+    asyncio.run(notifier._check_pre_session(bot))
     return bot, marked
 
 
@@ -205,4 +208,38 @@ def test_urgent_ping_close_to_start(monkeypatch):
 
 def test_no_ping_after_session_started(monkeypatch):
     bot, marked = _run_check(monkeypatch, [_booking_row(minutes_left=-5)])
+    assert bot.sent == []
+
+
+def test_admin_reminded_even_when_link_exists(monkeypatch):
+    """Главное: раньше при готовой ссылке психолог не получал вообще ничего
+    и мог просто забыть про консультацию."""
+    url = "https://telemost.yandex.ru/j/123"
+    bot, marked = _run_check(monkeypatch, [_booking_row(minutes_left=10, meet_url=url)])
+    assert len(bot.sent) == 1
+    text = bot.sent[0]["text"]
+    assert "Скоро консультация" in text
+    assert url in text, "ссылка должна быть прямо в напоминании"
+    assert marked == [(1, "prompt")]
+
+
+def test_reminder_with_link_offers_resend_and_replace(monkeypatch):
+    bot, _ = _run_check(monkeypatch, [_booking_row(minutes_left=10, meet_url="https://x.ru/1")])
+    actions = [b.callback_data for r in bot.sent[0]["markup"].inline_keyboard for b in r]
+    assert actions == ["resend:1", "relink:1"]
+
+
+def test_no_second_ping_when_link_is_in_place(monkeypatch):
+    """Повторный пинг за пару минут нужен только когда ссылки нет."""
+    bot, marked = _run_check(monkeypatch, [
+        _booking_row(minutes_left=2, prompt_sent=1, meet_url="https://x.ru/1")
+    ])
+    assert bot.sent == []
+    assert marked == []
+
+
+def test_reminder_sent_once_per_booking(monkeypatch):
+    bot, _ = _run_check(monkeypatch, [
+        _booking_row(minutes_left=10, prompt_sent=1, meet_url="https://x.ru/1")
+    ])
     assert bot.sent == []

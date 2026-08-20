@@ -16,7 +16,7 @@ from config import (
     ADMIN_LINK_PROMPT_MIN, ADMIN_LINK_RETRY_MIN, ADMIN_TELEGRAM_ID, TIMEZONE,
 )
 from database import (
-    get_bookings_needing_link, get_pending_reminders, mark_link_prompt_sent,
+    get_pending_reminders, get_upcoming_bookings, mark_link_prompt_sent,
     mark_reminder_sent,
 )
 
@@ -89,52 +89,74 @@ async def _send_5min_reminder(bot: Bot, telegram_id: int, booking_id: int, slot_
         logger.error(f"Ошибка отправки 5min напоминания booking_id={booking_id}: {e}")
 
 
-def link_prompt_keyboard(booking_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📎 Отправить ссылку клиенту",
-                              callback_data=f"sendlink:{booking_id}")],
-    ])
+def link_actions_keyboard(booking_id: int, has_link: bool) -> InlineKeyboardMarkup:
+    """Кнопки управления ссылкой. Живёт здесь, а не в handlers/admin.py, чтобы
+    напоминание и команда /link предлагали одно и то же."""
+    if has_link:
+        rows = [
+            [InlineKeyboardButton(text="📤 Прислать повторно", callback_data=f"resend:{booking_id}")],
+            [InlineKeyboardButton(text="🔄 Заменить ссылку", callback_data=f"relink:{booking_id}")],
+        ]
+    else:
+        rows = [[InlineKeyboardButton(text="📎 Отправить ссылку клиенту",
+                                      callback_data=f"sendlink:{booking_id}")]]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-async def _prompt_admin_for_link(bot: Bot, booking, minutes_left: int, urgent: bool) -> None:
-    """Просит психолога прислать ссылку на встречу.
+def _pre_session_text(booking, slot_start: datetime, minutes_left: int, urgent: bool) -> str:
+    """Одно напоминание на два случая: ссылка есть — просто предупреждаем о встрече,
+    ссылки нет — просим прислать."""
+    meet_url = booking["meet_url"] or ""
+    when = f"Через {minutes_left} мин — {booking['name']}, {format_slot(slot_start)} МСК"
+    tail = f"Запись #{booking['id']}"
 
-    Ссылка больше не генерится автоматически — психолог создаёт звонок сам и
-    отправляет через бота. Отправленная ссылка сохраняется на клиенте, так что
-    этот запрос приходит только на первую запись каждого клиента."""
+    if meet_url:
+        return f"⏰ Скоро консультация\n\n{when}\n{tail}\n\nСсылка:\n{meet_url}"
+
+    head = "‼️ Ссылки всё ещё нет" if urgent else "🔗 Нужна ссылка на встречу"
+    return (
+        f"{head}\n\n{when}\n{tail}\n\n"
+        f"Создай звонок и пришли ссылку — я передам клиенту и запомню её "
+        f"для следующих записей."
+    )
+
+
+async def _notify_admin_pre_session(bot: Bot, booking, minutes_left: int, urgent: bool) -> None:
     if not ADMIN_TELEGRAM_ID:
         return
     slot_start = datetime.fromisoformat(booking["slot_start"]).astimezone(MOSCOW_TZ)
-    head = "‼️ Ссылки всё ещё нет" if urgent else "🔗 Нужна ссылка на встречу"
     try:
         await bot.send_message(
             chat_id=ADMIN_TELEGRAM_ID,
-            text=(
-                f"{head}\n\n"
-                f"Через {minutes_left} мин — {booking['name']}, {format_slot(slot_start)} МСК\n"
-                f"Запись #{booking['id']}\n\n"
-                f"Создай звонок и пришли ссылку — я передам клиенту и запомню её "
-                f"для следующих записей."
-            ),
-            reply_markup=link_prompt_keyboard(booking["id"]),
+            text=_pre_session_text(booking, slot_start, minutes_left, urgent),
+            reply_markup=link_actions_keyboard(booking["id"], bool(booking["meet_url"])),
         )
     except Exception as e:
-        logger.error(f"Не удалось запросить ссылку по booking_id={booking['id']}: {e}")
+        logger.error(f"Не удалось напомнить о booking_id={booking['id']}: {e}")
         return
     await mark_link_prompt_sent(booking["id"], "retry" if urgent else "prompt")
 
 
-async def _check_missing_links(bot: Bot) -> None:
+async def _check_pre_session(bot: Bot) -> None:
+    """Напоминание психологу перед каждой встречей.
+
+    Раньше пинг приходил только когда ссылки не было — то есть по записи с готовой
+    ссылкой психолог не получал вообще ничего и мог просто забыть про консультацию.
+    Теперь напоминание приходит всегда; повторный пинг за пару минут — только если
+    ссылки так и нет, дёргать дважды при живой ссылке незачем."""
     now = datetime.now(MOSCOW_TZ)
-    for b in await get_bookings_needing_link():
+    for b in await get_upcoming_bookings():
         slot_start = datetime.fromisoformat(b["slot_start"]).astimezone(MOSCOW_TZ)
         minutes_left = (slot_start - now).total_seconds() / 60
         if minutes_left <= 0:
             continue
-        if not b["admin_link_retry_sent"] and minutes_left <= ADMIN_LINK_RETRY_MIN:
-            await _prompt_admin_for_link(bot, b, ADMIN_LINK_RETRY_MIN, urgent=True)
+
+        has_link = bool(b["meet_url"])
+        if (not has_link and not b["admin_link_retry_sent"]
+                and minutes_left <= ADMIN_LINK_RETRY_MIN):
+            await _notify_admin_pre_session(bot, b, ADMIN_LINK_RETRY_MIN, urgent=True)
         elif not b["admin_link_prompt_sent"] and minutes_left <= ADMIN_LINK_PROMPT_MIN:
-            await _prompt_admin_for_link(bot, b, ADMIN_LINK_PROMPT_MIN, urgent=False)
+            await _notify_admin_pre_session(bot, b, ADMIN_LINK_PROMPT_MIN, urgent=False)
 
 
 async def reminder_loop(bot: Bot):
@@ -146,7 +168,7 @@ async def reminder_loop(bot: Bot):
     while True:
         try:
             now = datetime.now(MOSCOW_TZ)
-            await _check_missing_links(bot)
+            await _check_pre_session(bot)
             bookings = await get_pending_reminders()
 
             for b in bookings:
