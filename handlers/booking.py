@@ -4,7 +4,6 @@ FSM-флоу записи на консультацию.
 from __future__ import annotations
 
 import logging
-import uuid
 from datetime import date, datetime, timedelta
 
 import pytz
@@ -16,8 +15,8 @@ from aiogram.types import (
     KeyboardButton, Message, ReplyKeyboardMarkup, ReplyKeyboardRemove,
 )
 
-from config import ADMIN_TELEGRAM_ID, MIN_HOURS_BEFORE, SLOTS_DAYS_AHEAD, TIMEZONE, MEET_URL
-from database import create_booking, get_booking, get_user_bookings, cancel_booking, get_client, upsert_client, save_consent, delete_client, has_consent, create_pending_custom
+from config import ADMIN_TELEGRAM_ID, MIN_HOURS_BEFORE, SLOTS_DAYS_AHEAD, TIMEZONE
+from database import create_booking, get_booking, get_user_bookings, cancel_booking, get_client, get_client_meet_url, upsert_client, save_consent, delete_client, has_consent, create_pending_custom
 from services.calendar_service import create_event, delete_event, get_busy_slots
 from services.date_parser import LLMUnavailable, is_outside_work_hours, parse_user_input
 from services.notifier import notify_admin_error
@@ -751,7 +750,10 @@ async def handle_confirm(message: Message, state: FSMContext, bot: Bot):
     except Exception as e:
         logger.warning(f"Не удалось проверить занятость перед созданием: {e}")
 
-    meet_url = f"https://meet.jit.si/georg-psych-{uuid.uuid4().hex[:10]}"
+    # Ссылка больше не генерится: постоянная ссылка клиента подставляется, если он
+    # уже был; для нового клиента остаётся пустой — психолог пришлёт её через бота
+    # перед встречей, и она сохранится на клиенте для следующих записей.
+    meet_url = await get_client_meet_url(message.from_user.id)
 
     try:
         tg_username = message.from_user.username or ""
@@ -785,12 +787,19 @@ async def handle_confirm(message: Message, state: FSMContext, bot: Bot):
             f"Контакт: {contact}\n"
             f"TG: {tg_link}\n"
             f"Время: {fmt_slot(slot_start)}\n"
-            f"Телемост: {meet_url}"
+            + (f"Ссылка: {meet_url} (сохранённая, отправлена клиенту)"
+               if meet_url else "⚠️ Ссылки нет — попрошу прислать перед встречей")
         ),
     )
 
+    if meet_url:
+        link_line = f"Подключайтесь по ссылке к началу:\n{meet_url}\n\n"
+    else:
+        link_line = "Ссылку на видеовстречу пришлю сюда за 10–15 минут до начала.\n\n"
+
     await message.answer(
         f"Готово! Вы записаны на {fmt_slot(slot_start)}.\n\n"
+        f"{link_line}"
         f"Пришлю напоминание за сутки и за час до начала.\n"
         f"Чтобы отменить запись — /cancel",
         reply_markup=MAIN_KB,

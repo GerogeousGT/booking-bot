@@ -58,7 +58,7 @@ def create_event(name: str, contact: str, slot_start: datetime, slot_end: dateti
     if tg_username:
         description += f"\nTelegram: @{tg_username}"
     if meet_url:
-        description += f"\nТелемост: {meet_url}"
+        description += f"\nСсылка: {meet_url}"
     event = {
         "summary": f"Консультация — {name}",
         "description": description,
@@ -69,6 +69,31 @@ def create_event(name: str, contact: str, slot_start: datetime, slot_end: dateti
     created = service.events().insert(calendarId=GOOGLE_CALENDAR_ID, body=event).execute()
     logger.info(f"Создано событие {created['id']} для {name} на {slot_start}")
     return created["id"]
+
+
+def set_event_meet_url(event_id: str, meet_url: str) -> bool:
+    """Дописывает ссылку на встречу в описание уже созданного события.
+
+    Нужно потому, что ссылка теперь приходит не в момент записи, а позже — когда
+    психолог пришлёт её через бота. Без этого ссылка жила бы только в переписке."""
+    if not event_id or not meet_url:
+        return False
+    try:
+        service = _get_service()
+        event = service.events().get(calendarId=GOOGLE_CALENDAR_ID, eventId=event_id).execute()
+        description = event.get("description", "")
+        # Старую строку со ссылкой заменяем, а не копим — ссылку могли поменять
+        lines = [ln for ln in description.split("\n") if not ln.startswith("Ссылка:")]
+        lines.append(f"Ссылка: {meet_url}")
+        event["description"] = "\n".join(lines).strip()
+        service.events().update(
+            calendarId=GOOGLE_CALENDAR_ID, eventId=event_id, body=event
+        ).execute()
+        logger.info(f"Ссылка записана в событие {event_id}")
+        return True
+    except HttpError as e:
+        logger.error(f"Не удалось записать ссылку в событие {event_id}: {e}")
+        return False
 
 
 def delete_event(event_id: str) -> bool:

@@ -10,9 +10,15 @@ from datetime import datetime, timedelta
 
 import pytz
 from aiogram import Bot
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-from config import ADMIN_TELEGRAM_ID, TIMEZONE
-from database import get_pending_reminders, mark_reminder_sent
+from config import (
+    ADMIN_LINK_PROMPT_MIN, ADMIN_LINK_RETRY_MIN, ADMIN_TELEGRAM_ID, TIMEZONE,
+)
+from database import (
+    get_bookings_needing_link, get_pending_reminders, mark_link_prompt_sent,
+    mark_reminder_sent,
+)
 
 logger = logging.getLogger(__name__)
 MOSCOW_TZ = pytz.timezone(TIMEZONE)
@@ -70,9 +76,11 @@ async def _send_5min_reminder(bot: Bot, telegram_id: int, booking_id: int, slot_
         f"Время: {format_slot(slot_start)} МСК\n\n"
     )
     if meet_url:
+        # Дублируем ссылку, даже если клиент уже получал её при записи — чтобы не
+        # искать её в переписке недельной давности за минуту до начала
         text += f"Ссылка для подключения:\n{meet_url}"
     else:
-        text += "Специалист свяжется с вами."
+        text += "Ссылку на подключение пришлю сюда с минуты на минуту."
     try:
         await bot.send_message(chat_id=telegram_id, text=text)
         await mark_reminder_sent(booking_id, "5min")
@@ -81,11 +89,64 @@ async def _send_5min_reminder(bot: Bot, telegram_id: int, booking_id: int, slot_
         logger.error(f"Ошибка отправки 5min напоминания booking_id={booking_id}: {e}")
 
 
+def link_prompt_keyboard(booking_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📎 Отправить ссылку клиенту",
+                              callback_data=f"sendlink:{booking_id}")],
+    ])
+
+
+async def _prompt_admin_for_link(bot: Bot, booking, minutes_left: int, urgent: bool) -> None:
+    """Просит психолога прислать ссылку на встречу.
+
+    Ссылка больше не генерится автоматически — психолог создаёт звонок сам и
+    отправляет через бота. Отправленная ссылка сохраняется на клиенте, так что
+    этот запрос приходит только на первую запись каждого клиента."""
+    if not ADMIN_TELEGRAM_ID:
+        return
+    slot_start = datetime.fromisoformat(booking["slot_start"]).astimezone(MOSCOW_TZ)
+    head = "‼️ Ссылки всё ещё нет" if urgent else "🔗 Нужна ссылка на встречу"
+    try:
+        await bot.send_message(
+            chat_id=ADMIN_TELEGRAM_ID,
+            text=(
+                f"{head}\n\n"
+                f"Через {minutes_left} мин — {booking['name']}, {format_slot(slot_start)} МСК\n"
+                f"Запись #{booking['id']}\n\n"
+                f"Создай звонок и пришли ссылку — я передам клиенту и запомню её "
+                f"для следующих записей."
+            ),
+            reply_markup=link_prompt_keyboard(booking["id"]),
+        )
+    except Exception as e:
+        logger.error(f"Не удалось запросить ссылку по booking_id={booking['id']}: {e}")
+        return
+    await mark_link_prompt_sent(booking["id"], "retry" if urgent else "prompt")
+
+
+async def _check_missing_links(bot: Bot) -> None:
+    now = datetime.now(MOSCOW_TZ)
+    for b in await get_bookings_needing_link():
+        slot_start = datetime.fromisoformat(b["slot_start"]).astimezone(MOSCOW_TZ)
+        minutes_left = (slot_start - now).total_seconds() / 60
+        if minutes_left <= 0:
+            continue
+        if not b["admin_link_retry_sent"] and minutes_left <= ADMIN_LINK_RETRY_MIN:
+            await _prompt_admin_for_link(bot, b, ADMIN_LINK_RETRY_MIN, urgent=True)
+        elif not b["admin_link_prompt_sent"] and minutes_left <= ADMIN_LINK_PROMPT_MIN:
+            await _prompt_admin_for_link(bot, b, ADMIN_LINK_PROMPT_MIN, urgent=False)
+
+
 async def reminder_loop(bot: Bot):
-    """Фоновая задача — проверяет напоминания каждые 5 минут."""
+    """Фоновая задача — проверяет напоминания раз в минуту.
+
+    Раньше цикл был раз в 5 минут; с ним окно «пнуть психолога за 3 минуты до
+    начала» можно было целиком проскочить между итерациями. Проверки — это
+    только чтение из SQLite, минутный интервал ничего не стоит."""
     while True:
         try:
             now = datetime.now(MOSCOW_TZ)
+            await _check_missing_links(bot)
             bookings = await get_pending_reminders()
 
             for b in bookings:
@@ -107,4 +168,4 @@ async def reminder_loop(bot: Bot):
         except Exception as e:
             logger.error(f"Ошибка в reminder_loop: {e}")
 
-        await asyncio.sleep(5 * 60)  # каждые 5 минут
+        await asyncio.sleep(60)

@@ -28,7 +28,13 @@ PROXYAPI_KEY: str = os.getenv("PROXYAPI_KEY", "")
 PROXYAPI_BASE_URL: str = os.getenv("PROXYAPI_BASE_URL", "https://api.proxyapi.ru/openai/v1")
 GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
 
-# Постоянная ссылка для видеоконсультаций
-MEET_URL: str = os.getenv("MEET_URL", "")
+# ─── Ссылка на видеовстречу ───
+# Автогенерация убрана (публичный meet.jit.si в РФ не работает: комната открывается,
+# медиа не идёт). Ссылку присылает психолог через бота — она сохраняется на клиенте
+# и со второй записи подставляется автоматически.
+# За сколько минут до сессии напомнить психологу прислать ссылку:
+ADMIN_LINK_PROMPT_MIN: int = int(os.getenv("ADMIN_LINK_PROMPT_MIN", "15"))
+# И за сколько минут пнуть повторно, если ссылки всё ещё нет:
+ADMIN_LINK_RETRY_MIN: int = int(os.getenv("ADMIN_LINK_RETRY_MIN", "3"))
 
 DB_PATH: str = os.getenv("DB_PATH", "bookings.db")

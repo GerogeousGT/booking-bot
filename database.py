@@ -37,7 +37,19 @@ async def init_db() -> None:
                 reminder_5min_sent INTEGER NOT NULL DEFAULT 0
             )
         """)
+        # Колонки, добавленные после первого релиза. CREATE TABLE IF NOT EXISTS их
+        # в живую базу не принесёт, поэтому догоняем через ALTER — идемпотентно.
+        await _ensure_column(db, "bookings", "admin_link_prompt_sent", "INTEGER NOT NULL DEFAULT 0")
+        await _ensure_column(db, "bookings", "admin_link_retry_sent", "INTEGER NOT NULL DEFAULT 0")
+        await _ensure_column(db, "clients", "meet_url", "TEXT")
         await db.commit()
+
+
+async def _ensure_column(db, table: str, column: str, ddl: str) -> None:
+    async with db.execute(f"PRAGMA table_info({table})") as cur:
+        existing = {row[1] for row in await cur.fetchall()}
+    if column not in existing:
+        await db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
 
 async def create_booking(
@@ -87,6 +99,53 @@ async def get_user_bookings(telegram_id: int):
 async def cancel_booking(booking_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("UPDATE bookings SET status = 'cancelled' WHERE id = ?", (booking_id,))
+        await db.commit()
+
+
+async def set_booking_meet_url(booking_id: int, meet_url: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE bookings SET meet_url = ? WHERE id = ?", (meet_url, booking_id))
+        await db.commit()
+
+
+async def set_client_meet_url(telegram_id: int, meet_url: str):
+    """Постоянная ссылка клиента: отправили один раз — дальше подставляется сама."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE clients SET meet_url = ? WHERE telegram_id = ?", (meet_url, telegram_id)
+        )
+        await db.commit()
+
+
+async def get_client_meet_url(telegram_id: int) -> str:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT meet_url FROM clients WHERE telegram_id = ?", (telegram_id,)
+        ) as cur:
+            row = await cur.fetchone()
+    return (row[0] or "") if row else ""
+
+
+async def get_bookings_needing_link():
+    """Будущие записи без ссылки — по ним психологу надо напомнить."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """SELECT * FROM bookings
+               WHERE status = 'confirmed'
+               AND slot_start > datetime('now')
+               AND (meet_url IS NULL OR meet_url = '')
+               ORDER BY slot_start"""
+        ) as cur:
+            return await cur.fetchall()
+
+
+async def mark_link_prompt_sent(booking_id: int, kind: str):
+    field = {"prompt": "admin_link_prompt_sent", "retry": "admin_link_retry_sent"}.get(
+        kind, "admin_link_prompt_sent"
+    )
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(f"UPDATE bookings SET {field} = 1 WHERE id = ?", (booking_id,))
         await db.commit()
 
 
