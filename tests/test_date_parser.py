@@ -1,17 +1,26 @@
 """
 Тесты парсинга пользовательского ввода.
+
+Отдельно проверяется, что фолбэк-слой разбирает частые формулировки БЕЗ обращения
+к LLM: 2026-08-17 провайдер снял модель и вся воронка записи встала, потому что
+других слоёв парсинга не было. Тест `test_no_llm_calls_on_common_phrases` — страховка
+от повторения: если кто-то снова заведёт всё на сеть, он упадёт.
 """
+from datetime import date, datetime, timedelta
+
 import pytest
-from services.date_parser import detect_period, is_outside_work_hours
-from datetime import datetime
 import pytz
+
+from services.date_parser import (
+    LLMUnavailable, _fallback_parse, detect_period, is_outside_work_hours,
+    parse_user_input,
+)
 
 MOSCOW_TZ = pytz.timezone("Europe/Moscow")
 
 
 def make_dt(weekday_offset=0, hour=10) -> datetime:
     """Создаёт datetime в МСК. weekday_offset=0 — ближайший понедельник."""
-    from datetime import date, timedelta
     today = date.today()
     days_ahead = (0 - today.weekday()) % 7  # до ближайшего пн
     monday = today + timedelta(days=days_ahead if days_ahead else 7)
@@ -64,3 +73,89 @@ def test_evening_period_outside():
 def test_morning_period_inside():
     monday = make_dt(weekday_offset=0, hour=0)
     assert is_outside_work_hours(monday, (9, 11)) is False
+
+
+# ─── фолбэк-парсер (без сети) ───────────────────────────────
+
+def test_fallback_tomorrow_with_time():
+    today = datetime.now(MOSCOW_TZ).date()
+    out = _fallback_parse("завтра в 15:00")
+    assert out["date"] == (today + timedelta(days=1)).isoformat()
+    assert out["time"] == "15:00"
+
+
+def test_fallback_tomorrow_bare_hour():
+    out = _fallback_parse("завтра в 10")
+    assert out["time"] == "10:00"
+
+
+def test_fallback_weekday_with_period():
+    out = _fallback_parse("в пятницу утром")
+    assert out["weekday"] == "friday"
+    assert out["period"] == "morning"
+    assert out["time"] is None
+
+
+def test_fallback_day_and_month_not_read_as_time():
+    """«15 июля» — это дата, а не 15:00. Раньше на этом легко было споткнуться."""
+    out = _fallback_parse("15 июля")
+    assert out["date"].endswith("-07-15")
+    assert out["time"] is None
+
+
+def test_fallback_day_month_with_time():
+    out = _fallback_parse("15 июля в 14:00")
+    assert out["date"].endswith("-07-15")
+    assert out["time"] == "14:00"
+
+
+def test_fallback_dot_date():
+    out = _fallback_parse("20.09 в 11:30")
+    assert out["date"].endswith("-09-20")
+    assert out["time"] == "11:30"
+
+
+def test_fallback_next_week():
+    out = _fallback_parse("на следующей неделе в 14:00")
+    assert out["date_range"] == "next_week"
+    assert out["time"] == "14:00"
+
+
+def test_fallback_past_date_rolls_to_next_year():
+    """Дата, которая уже прошла в этом году, уезжает на следующий, а не в прошлое."""
+    today = datetime.now(MOSCOW_TZ).date()
+    yesterday = today - timedelta(days=1)
+    out = _fallback_parse(f"{yesterday.day}.{yesterday.month:02d}")
+    assert date.fromisoformat(out["date"]) >= today
+
+
+def test_fallback_gives_up_on_nonsense():
+    assert _fallback_parse("хочу к психологу") is None
+    assert _fallback_parse("") is None
+
+
+def test_no_llm_calls_on_common_phrases(monkeypatch):
+    """Частые формулировки должны разбираться без единого обращения к провайдеру."""
+    def explode(*args, **kwargs):
+        raise AssertionError("фолбэк не сработал — ушли в LLM")
+
+    monkeypatch.setattr("services.date_parser._call_llm", explode)
+
+    for phrase in [
+        "завтра в 15:00", "в пятницу утром", "сегодня после обеда",
+        "15 июля в 14:00", "20.09 в 11:30", "на следующей неделе в 14:00",
+        "послезавтра в 12", "в среду вечером",
+    ]:
+        assert parse_user_input(phrase) is not None, phrase
+
+
+def test_llm_failure_raises_llm_unavailable(monkeypatch):
+    """Отказ провайдера — отдельное исключение, чтобы хендлер дёрнул админа,
+    а не ответил клиенту «не понял» и не замолчал на три дня."""
+    def explode(*args, **kwargs):
+        raise RuntimeError("model_not_found")
+
+    monkeypatch.setattr("services.date_parser._call_llm", explode)
+
+    with pytest.raises(LLMUnavailable):
+        parse_user_input("когда-нибудь на неделе, как получится")

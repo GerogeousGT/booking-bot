@@ -31,7 +31,9 @@ Telegram-бот для онлайн-записи на консультацию. 
 ## Стек
 
 - [aiogram 3.x](https://docs.aiogram.dev/) — Telegram Bot API
-- [Groq API](https://groq.com/) — парсинг свободного текста (llama-3.1-8b-instant)
+- LLM для парсинга свободного текста — ProxyAPI (`gpt-4o-mini`) по умолчанию, Groq как запасной
+  вариант; провайдер переключается через `LLM_PROVIDER` в `.env` (см. `services/llm_provider.py`).
+  Сначала работает детерминированный фолбэк-парсер, LLM подключается только на нестандартных формулировках
 - [Google Calendar API](https://developers.google.com/calendar) — Service Account, без OAuth
 - [aiosqlite](https://aiosqlite.omnilib.dev/) — SQLite: bookings, clients, consents, pending_custom
 - [Jitsi Meet](https://meet.jit.si/) — видеозвонки (уникальная ссылка на каждую сессию)
@@ -52,7 +54,8 @@ booking-bot/
 ├── services/
 │   ├── calendar_service.py # Google Calendar API: freebusy + create + delete
 │   ├── slot_finder.py      # генерация свободных слотов с учётом рабочих часов
-│   ├── date_parser.py      # парсинг свободного текста → datetime через Groq
+│   ├── date_parser.py      # парсинг свободного текста → datetime (фолбэк + LLM)
+│   ├── llm_provider.py     # единая точка выбора LLM-провайдера
 │   └── notifier.py         # asyncio-цикл напоминаний (24h / 1h / 5min)
 └── tests/
     ├── test_slot_finder.py

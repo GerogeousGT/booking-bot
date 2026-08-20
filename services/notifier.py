@@ -11,11 +11,15 @@ from datetime import datetime, timedelta
 import pytz
 from aiogram import Bot
 
-from config import TIMEZONE
+from config import ADMIN_TELEGRAM_ID, TIMEZONE
 from database import get_pending_reminders, mark_reminder_sent
 
 logger = logging.getLogger(__name__)
 MOSCOW_TZ = pytz.timezone(TIMEZONE)
+
+# Чтобы падающий внешний сервис не превратился в поток одинаковых сообщений админу
+ADMIN_ALERT_COOLDOWN_SEC = 30 * 60
+_last_admin_alert: dict[str, float] = {}
 
 WEEKDAYS_RU = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
 
@@ -23,6 +27,26 @@ WEEKDAYS_RU = ["понедельник", "вторник", "среда", "чет
 def format_slot(dt: datetime) -> str:
     day = WEEKDAYS_RU[dt.weekday()]
     return f"{dt.strftime('%d.%m')} ({day}) в {dt.strftime('%H:00')}"
+
+
+async def notify_admin_error(bot: Bot, kind: str, text: str) -> None:
+    """Сообщает админу о поломке внешнего сервиса.
+
+    Заведено после 2026-08-17: провайдер снял модель, бот три дня отвечал клиентам
+    «не понял запрос», и узнали об этом только от клиента. Молчаливых отказов в
+    воронке записи быть не должно. `kind` — ключ троттлинга, чтобы одна и та же
+    поломка не спамила каждым сообщением клиента."""
+    if not ADMIN_TELEGRAM_ID:
+        return
+    import time as _time
+    now = _time.monotonic()
+    if now - _last_admin_alert.get(kind, 0) < ADMIN_ALERT_COOLDOWN_SEC:
+        return
+    _last_admin_alert[kind] = now
+    try:
+        await bot.send_message(chat_id=ADMIN_TELEGRAM_ID, text=f"⚠️ Booking bot\n\n{text}")
+    except Exception as e:
+        logger.error(f"Не удалось уведомить админа ({kind}): {e}")
 
 
 async def _send_reminder(bot: Bot, telegram_id: int, booking_id: int, slot_start: datetime, when: str):

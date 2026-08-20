@@ -19,7 +19,8 @@ from aiogram.types import (
 from config import ADMIN_TELEGRAM_ID, MIN_HOURS_BEFORE, SLOTS_DAYS_AHEAD, TIMEZONE, MEET_URL
 from database import create_booking, get_booking, get_user_bookings, cancel_booking, get_client, upsert_client, save_consent, delete_client, has_consent, create_pending_custom
 from services.calendar_service import create_event, delete_event, get_busy_slots
-from services.date_parser import is_outside_work_hours, parse_user_input
+from services.date_parser import LLMUnavailable, is_outside_work_hours, parse_user_input
+from services.notifier import notify_admin_error
 from services.slot_finder import (
     SLOT_DURATION, build_search_range, filter_free_slots, generate_candidate_slots,
     find_days_with_hour,
@@ -88,6 +89,44 @@ async def _find_slots(parsed_dt: datetime, period) -> list[datetime]:
     busy = get_busy_slots(search_start, search_end + timedelta(hours=1))
     candidates = generate_candidate_slots(search_start, search_end, period)
     return filter_free_slots(candidates, busy)
+
+
+async def _find_nearest_slots(limit: int = MAX_SLOTS_SHOWN) -> list[datetime]:
+    """Ближайшие свободные слоты на весь горизонт записи, без привязки к дню."""
+    now = datetime.now(MOSCOW_TZ)
+    busy = get_busy_slots(now, now + timedelta(days=SLOTS_DAYS_AHEAD))
+    candidates = generate_candidate_slots(
+        now + timedelta(hours=MIN_HOURS_BEFORE), now + timedelta(days=SLOTS_DAYS_AHEAD)
+    )
+    return filter_free_slots(candidates, busy)[:limit]
+
+
+# Запасной выход, когда разобрать текст не получилось: не выкидываем клиента из
+# сценария, а даём нажать кнопку. До 2026-08-17 тут был state.clear() — человек
+# после неудачной формулировки просто оказывался в начале.
+NEAREST_KB = InlineKeyboardMarkup(inline_keyboard=[
+    [InlineKeyboardButton(text="📅 Показать ближайшие свободные слоты", callback_data="nearest")],
+])
+
+
+async def _show_nearest_slots(message: Message, state: FSMContext, intro: str) -> None:
+    try:
+        slots = await _find_nearest_slots()
+    except Exception as e:
+        logger.error(f"Ошибка Calendar API: {e}")
+        await message.answer("Не удалось загрузить расписание. Напишите напрямую: @SlammG")
+        return
+
+    if not slots:
+        await message.answer(
+            f"На ближайшие {SLOTS_DAYS_AHEAD} дней свободных слотов нет.\n"
+            "Напишите напрямую: @SlammG"
+        )
+        return
+
+    await message.answer(intro, reply_markup=slots_keyboard(slots))
+    await state.update_data(is_custom=False)
+    await state.set_state(BookingState.waiting_for_slot_choice)
 
 
 # ─────────────────────── /start ────────────────────────
@@ -176,18 +215,37 @@ async def handle_time_input(message: Message, state: FSMContext):
         await cmd_cancel(message)
         return
 
-    result = parse_user_input(text, user_id=message.from_user.id)
+    try:
+        result = parse_user_input(text, user_id=message.from_user.id)
+    except LLMUnavailable as e:
+        logger.error(f"LLM недоступен на вводе {text!r}: {e}")
+        await notify_admin_error(
+            message.bot,
+            kind="llm_down",
+            text=(
+                "Разбор свободного текста не работает — LLM-провайдер недоступен.\n\n"
+                f"Ошибка: {e}\n\n"
+                "Клиентам сейчас показываются ближайшие слоты кнопками, запись работает. "
+                "Проверь LLM_PROVIDER / ключ."
+            ),
+        )
+        await _show_nearest_slots(
+            message, state,
+            "Не удалось разобрать время автоматически. Вот ближайшие свободные слоты — "
+            "выберите подходящий:",
+        )
+        return
+
     if result is None:
+        # Состояние НЕ сбрасываем: клиент остаётся в сценарии и может переформулировать
         await message.answer(
-            "Не понял запрос. Укажите удобное время:\n"
+            "Не понял запрос. Напишите иначе:\n"
             "• «в понедельник после обеда»\n"
             "• «завтра в 10»\n"
             "• «на следующей неделе в 14:00»\n"
-            "• «15 июля в 14:00»\n\n"
-            "Или нажмите кнопку ниже:",
-            reply_markup=MAIN_KB,
+            "• «15 июля в 14:00»",
+            reply_markup=NEAREST_KB,
         )
-        await state.clear()
         return
 
     parsed_dt = result["dt"]
@@ -373,6 +431,17 @@ async def handle_time_input(message: Message, state: FSMContext):
 
     await state.update_data(is_custom=False)
     await state.set_state(BookingState.waiting_for_slot_choice)
+
+
+# ─────────────────────── ближайшие слоты (после неудачного разбора) ───────
+
+@router.callback_query(F.data == "nearest")
+async def handle_nearest(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await _show_nearest_slots(
+        callback.message, state, "Ближайшие свободные слоты:"
+    )
+    await callback.answer()
 
 
 # ─────────────────────── показать весь день (после "нет слотов в период") ───────

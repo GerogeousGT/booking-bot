@@ -1,16 +1,26 @@
 """
-Парсинг свободного текста через Groq (llama-3.1-8b-instant).
+Парсинг свободного текста в дату/время консультации.
+
+Два слоя:
+  1. `_fallback_parse` — детерминированный разбор частых формулировок
+     («завтра в 15», «в пятницу утром», «15.08 в 14:00», «на следующей неделе в 14»).
+     Работает без сети, бесплатно, мгновенно.
+  2. LLM (см. services/llm_provider.py) — только если первый слой не справился.
+
+Порядок именно такой после инцидента 2026-08-17: провайдер снял модель, единственный
+слой парсинга умер, и вместе с ним вся воронка записи. Теперь отказ LLM ломает только
+редкие формулировки, а не весь бот.
 """
 from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from datetime import date, datetime, timedelta
 from typing import Optional, TypedDict
 
 import pytz
-from groq import Groq
 
 from config import TIMEZONE
 
@@ -32,6 +42,13 @@ _last_call: dict[int, float] = {}
 RATE_LIMIT_SEC = 4
 
 
+class LLMUnavailable(RuntimeError):
+    """LLM недоступен (сеть, ключ, снятая модель), а фолбэк ввод не распознал.
+
+    Отдельный тип, чтобы хендлер отличил «клиент написал ерунду» от «у нас сломан
+    провайдер» и во втором случае дёрнул админа, а не молча ответил «не понял»."""
+
+
 class ParseResult(TypedDict):
     dt: datetime                        # базовая дата (начало диапазона при date_range)
     period: Optional[tuple[int, int]]   # период дня или None
@@ -39,42 +56,204 @@ class ParseResult(TypedDict):
     target_hour: Optional[int]          # конкретный час при поиске по диапазону (напр. 14)
 
 
-def _get_client() -> Groq:
-    from config import GROQ_API_KEY
-    return Groq(api_key=GROQ_API_KEY)
+# ─────────────────── слой 1: детерминированный разбор ───────────────────
 
+MONTHS_RU = ["января", "февраля", "марта", "апреля", "мая", "июня",
+             "июля", "августа", "сентября", "октября", "ноября", "декабря"]
+
+_MONTH_RE = r"(январ|феврал|март|апрел|ма[йя]|июн|июл|август|сентябр|октябр|ноябр|декабр)"
+
+_MONTH_NUM = {
+    "январ": 1, "феврал": 2, "март": 3, "апрел": 4, "май": 5, "мая": 5,
+    "июн": 6, "июл": 7, "август": 8, "сентябр": 9, "октябр": 10, "ноябр": 11, "декабр": 12,
+}
+
+_WEEKDAY_RE = {
+    "monday":    r"понедельник\w*|\bпн\b",
+    "tuesday":   r"вторник\w*|\bвт\b",
+    "wednesday": r"сред[ауые]\w*|\bср\b",
+    "thursday":  r"четверг\w*|\bчт\b",
+    "friday":    r"пятниц[ауые]\w*|\bпт\b",
+    "saturday":  r"суббот[ауые]\w*|\bсб\b",
+    "sunday":    r"воскресен\w*|\bвс\b",
+}
+
+_PERIOD_RE = {
+    "morning":   r"утр[оаому]\w*|с\s+утра",
+    "afternoon": r"после\s+обеда|\bднём\b|\bднем\b|\bдня\b|в\s+обед|обеден\w*",
+    "evening":   r"вечер\w*",
+}
+
+# Время: с двоеточием, со словом «час», либо после предлога («в 15», «к 10»).
+_TIME_COLON_RE = re.compile(r"(?<!\d)([01]?\d|2[0-3])[:.]([0-5]\d)(?!\d)")
+_TIME_WORD_RE = re.compile(r"(?<!\d)([01]?\d|2[0-3])\s*час(?:ов|а|у)?\b", re.IGNORECASE)
+_TIME_PREP_RE = re.compile(r"\b(?:в|к|на)\s+([01]?\d|2[0-3])(?!\s*\d)(?!\d)\b", re.IGNORECASE)
+
+
+def detect_period(text: str) -> Optional[tuple[int, int]]:
+    """Период дня из текста. None, если указано конкретное время — оно приоритетнее."""
+    if _extract_time(text) is not None:
+        return None
+    low = text.lower()
+    for name, pattern in _PERIOD_RE.items():
+        if re.search(pattern, low, re.IGNORECASE):
+            return PERIOD_HOURS[name]
+    return None
+
+
+def _extract_time(text: str) -> Optional[tuple[int, int]]:
+    """(час, минута) или None. Проверки — от самого однозначного к самому размытому."""
+    m = _TIME_COLON_RE.search(text)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    m = _TIME_WORD_RE.search(text)
+    if m:
+        return int(m.group(1)), 0
+    m = _TIME_PREP_RE.search(text)
+    if m:
+        return int(m.group(1)), 0
+    return None
+
+
+def _strip_dates(text: str) -> str:
+    """Убирает фрагменты-даты, чтобы «15 июля» не было прочитано как «15:00»."""
+    t = re.sub(rf"\b\d{{1,2}}\s*{_MONTH_RE}\w*", " ", text, flags=re.IGNORECASE)
+    t = re.sub(r"\b\d{1,2}\.\d{1,2}(?:\.\d{2,4})?\b", " ", t)
+    t = re.sub(r"\b\d{1,2}\s*(?:числа|го)\b", " ", t, flags=re.IGNORECASE)
+    return t
+
+
+def _month_from_stem(stem: str) -> Optional[int]:
+    stem = stem.lower()
+    for key in sorted(_MONTH_NUM, key=len, reverse=True):
+        if stem.startswith(key):
+            return _MONTH_NUM[key]
+    return None
+
+
+def _fallback_parse(text: str) -> Optional[dict]:
+    """Разбирает частые формулировки без LLM. Возвращает тот же словарь, что и модель, —
+    дальше оба слоя идут через общий `_build_result`."""
+    low = text.lower().strip()
+    if not low:
+        return None
+
+    today = datetime.now(MOSCOW_TZ).date()
+    out = {"date": None, "time": None, "period": None, "weekday": None, "date_range": None}
+
+    # ── дата ──
+    if re.search(r"\bпослезавтра\b", low):
+        out["date"] = (today + timedelta(days=2)).isoformat()
+    elif re.search(r"\bзавтра\b", low):
+        out["date"] = (today + timedelta(days=1)).isoformat()
+    elif re.search(r"\bсегодня\b", low):
+        out["date"] = today.isoformat()
+
+    if out["date"] is None:
+        m = re.search(r"через\s+(\d+)?\s*(день|дня|дней|недел[юия])", low)
+        if m:
+            n = int(m.group(1)) if m.group(1) else 1
+            delta = timedelta(weeks=n) if m.group(2).startswith("недел") else timedelta(days=n)
+            out["date"] = (today + delta).isoformat()
+
+    if out["date"] is None:
+        m = re.search(rf"\b(\d{{1,2}})\s*{_MONTH_RE}\w*", low, re.IGNORECASE)
+        if m:
+            day, month = int(m.group(1)), _month_from_stem(m.group(2))
+            if month and 1 <= day <= 31:
+                out["date"] = _resolve_date(today, month, day, roll_year=True)
+
+    if out["date"] is None:
+        m = re.search(r"\b(\d{1,2})\.(\d{1,2})(?:\.(\d{2,4}))?\b", low)
+        if m:
+            day, month = int(m.group(1)), int(m.group(2))
+            if 1 <= month <= 12 and 1 <= day <= 31:
+                if m.group(3):
+                    year = int(m.group(3))
+                    year += 2000 if year < 100 else 0
+                    try:
+                        out["date"] = date(year, month, day).isoformat()
+                    except ValueError:
+                        pass
+                else:
+                    out["date"] = _resolve_date(today, month, day, roll_year=True)
+
+    # ── неделя целиком ──
+    if out["date"] is None:
+        if re.search(r"(следующ|будущ)\w*\s+недел\w*|на\s+той\s+недел\w*", low):
+            out["date_range"] = "next_week"
+        elif re.search(r"(эт|текущ)\w*\s+недел\w*", low):
+            out["date_range"] = "current_week"
+
+    # ── день недели ──
+    if out["date"] is None and out["date_range"] is None:
+        for name, pattern in _WEEKDAY_RE.items():
+            if re.search(pattern, low, re.IGNORECASE):
+                out["weekday"] = name
+                break
+
+    if out["date"] is None and out["date_range"] is None and out["weekday"] is None:
+        return None  # дня нет — отдаём LLM, вдруг там что-то нестандартное
+
+    # ── время и период (по тексту без дат, чтобы не спутать «15 июля» с «15:00») ──
+    rest = _strip_dates(low)
+    hm = _extract_time(rest)
+    if hm:
+        out["time"] = f"{hm[0]:02d}:{hm[1]:02d}"
+    else:
+        for name, pattern in _PERIOD_RE.items():
+            if re.search(pattern, rest, re.IGNORECASE):
+                out["period"] = name
+                break
+
+    logger.info(f"Фолбэк-парсер разобрал ввод без LLM: {out}")
+    return out
+
+
+def _resolve_date(today: date, month: int, day: int, roll_year: bool) -> Optional[str]:
+    """«15 июля» без года: текущий год, а если дата уже прошла — следующий."""
+    try:
+        d = date(today.year, month, day)
+    except ValueError:
+        return None
+    if roll_year and d < today:
+        try:
+            d = date(today.year + 1, month, day)
+        except ValueError:
+            return None
+    return d.isoformat()
+
+
+# ─────────────────── слой 2: LLM ───────────────────
 
 def _preprocess(text: str) -> str:
-    """Нормализует ввод перед отправкой в Groq."""
-    import re
+    """Нормализует ввод перед отправкой в LLM."""
     t = text
+
     # "15.07" или "15.07.2026" → "15 июля" / "15 июля 2026"
-    months = ["января","февраля","марта","апреля","мая","июня","июля","августа","сентября","октября","ноября","декабря"]
     def replace_dot_date(m):
         d, mo = int(m.group(1)), int(m.group(2))
         if 1 <= mo <= 12:
             yr = m.group(3)
-            return f"{d} {months[mo-1]}{(' ' + yr) if yr else ''}"
+            return f"{d} {MONTHS_RU[mo-1]}{(' ' + yr) if yr else ''}"
         return m.group(0)
     t = re.sub(r'\b(\d{1,2})\.(\d{1,2})(?:\.(\d{4}))?\b', replace_dot_date, t)
+
     # "через 2 недели" / "через неделю" → конкретные даты
     now = date.today()
-    def replace_weeks(m):
-        n = int(m.group(1)) if m.group(1) else 1
-        target = now + timedelta(weeks=n)
-        return target.strftime("%-d %B").lower() if hasattr(now, 'strftime') else str(target)
-    t = re.sub(r'через\s+(\d+)\s+недел[ию]', replace_weeks, t, flags=re.IGNORECASE)
-    t = re.sub(r'через\s+неделю', lambda _: (now + timedelta(weeks=1)).isoformat(), t, flags=re.IGNORECASE)
+    t = re.sub(r'через\s+(\d+)\s+недел[ию]',
+               lambda m: (now + timedelta(weeks=int(m.group(1)))).isoformat(),
+               t, flags=re.IGNORECASE)
+    t = re.sub(r'через\s+неделю',
+               lambda _: (now + timedelta(weeks=1)).isoformat(), t, flags=re.IGNORECASE)
+
     # "в середине июля" → "15 июля"
-    mid_months = {"января":15,"февраля":14,"марта":15,"апреля":15,"мая":15,"июня":15,
-                  "июля":15,"августа":15,"сентября":15,"октября":15,"ноября":15,"декабря":15}
-    for month, day in mid_months.items():
-        t = re.sub(rf'в?\s*середин[ае]\s+{month}', f'{day} {month}', t, flags=re.IGNORECASE)
+    for month in MONTHS_RU:
+        t = re.sub(rf'в?\s*середин[ае]\s+{month}', f'15 {month}', t, flags=re.IGNORECASE)
     return t
 
 
 def _build_prompt() -> str:
-    from datetime import timedelta
     today = date.today()
     tomorrow = (today + timedelta(days=1)).isoformat()
     day_after = (today + timedelta(days=2)).isoformat()
@@ -99,6 +278,26 @@ def _build_prompt() -> str:
 - Игнорируй опечатки и старайся понять смысл."""
 
 
+def _call_llm(text: str) -> dict:
+    """Один запрос к провайдеру. Всё, что пошло не так, бросается наружу."""
+    from services.llm_provider import MODEL, get_client
+
+    client = get_client()
+    resp = client.chat.completions.create(
+        model=MODEL,
+        messages=[
+            {"role": "system", "content": _build_prompt()},
+            {"role": "user",   "content": _preprocess(text)[:200]},
+        ],
+        temperature=0,
+        max_tokens=150,
+        response_format={"type": "json_object"},
+    )
+    return json.loads(resp.choices[0].message.content.strip())
+
+
+# ─────────────────── общая сборка результата ───────────────────
+
 def _get_week_bounds(offset: int) -> tuple[datetime, datetime]:
     """Возвращает (пн, пт) нужной недели. offset=0 текущая, 1 следующая."""
     now = datetime.now(MOSCOW_TZ)
@@ -109,7 +308,7 @@ def _get_week_bounds(offset: int) -> tuple[datetime, datetime]:
     return monday, friday
 
 
-def _parse_groq_response(data: dict) -> Optional[ParseResult]:
+def _build_result(data: dict) -> Optional[ParseResult]:
     now = datetime.now(MOSCOW_TZ)
 
     raw_date    = data.get("date")    or None
@@ -186,6 +385,14 @@ def _parse_groq_response(data: dict) -> Optional[ParseResult]:
 
 
 def parse_user_input(text: str, user_id: int = 0) -> Optional[ParseResult]:
+    """Разбирает ввод. None — не поняли. LLMUnavailable — провайдер лежит."""
+    fallback = _fallback_parse(text)
+    if fallback:
+        result = _build_result(fallback)
+        if result:
+            return result
+
+    # Лимит только на обращения к LLM — бесплатный фолбэк выше он не трогает
     now_ts = time.monotonic()
     if user_id and now_ts - _last_call.get(user_id, 0) < RATE_LIMIT_SEC:
         logger.warning(f"Rate limit user_id={user_id}")
@@ -194,26 +401,15 @@ def parse_user_input(text: str, user_id: int = 0) -> Optional[ParseResult]:
         _last_call[user_id] = now_ts
 
     try:
-        client = _get_client()
-        processed = _preprocess(text)
-        resp = client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[
-                {"role": "system", "content": _build_prompt()},
-                {"role": "user",   "content": processed[:200]},
-            ],
-            temperature=0,
-            max_tokens=150,
-        )
-        raw = resp.choices[0].message.content.strip()
-        data = json.loads(raw)
-        return _parse_groq_response(data)
-    except json.JSONDecodeError:
-        logger.error(f"Groq вернул невалидный JSON: {raw!r}")
+        data = _call_llm(text)
+    except json.JSONDecodeError as e:
+        logger.error(f"LLM вернул невалидный JSON: {e}")
         return None
     except Exception as e:
-        logger.error(f"Ошибка Groq: {e}")
-        return None
+        logger.error(f"LLM недоступен: {e}")
+        raise LLMUnavailable(str(e)) from e
+
+    return _build_result(data)
 
 
 def is_outside_work_hours(dt: datetime, period: Optional[tuple[int, int]]) -> bool:

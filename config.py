@@ -17,6 +17,15 @@ SLOT_DURATION_MIN: int = 55
 MIN_HOURS_BEFORE: int = 2  # минимальный буфер до записи
 SLOTS_DAYS_AHEAD: int = 7  # показываем слоты на 7 дней вперёд
 
+# ─── LLM для парсинга свободного текста ("завтра в 15", "в пятницу утром") ───
+# Провайдер переключается одной переменной, см. services/llm_provider.py.
+# groq был бесплатным, но 2026-08-17 модель llama-3.1-8b-instant сняли без
+# предупреждения — воронка записи молча встала. Теперь основной — proxyapi.
+LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "proxyapi")  # proxyapi | groq
+LLM_MODEL: str = os.getenv("LLM_MODEL", "")  # пусто — берётся дефолт провайдера
+
+PROXYAPI_KEY: str = os.getenv("PROXYAPI_KEY", "")
+PROXYAPI_BASE_URL: str = os.getenv("PROXYAPI_BASE_URL", "https://api.proxyapi.ru/openai/v1")
 GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
 
 # Постоянная ссылка для видеоконсультаций
