@@ -1,3 +1,8 @@
+## [2026-08-25] — Groq снял llama-3.3-70b-versatile, обновлена запасная модель
+
+### Изменено
+- `services/llm_provider.py` — запасная модель Groq `llama-3.3-70b-versatile` заменена на `openai/gpt-oss-120b`: Groq убрал её из каталога, API отвечает `model_not_found`. Основной провайдер (ProxyAPI, `gpt-4o-mini`) не затронут, воронка записи работала всё это время — но фолбэк по `LLM_PROVIDER=groq` был мёртвым.
+
 # CHANGELOG
 
 ## [2026-08-20] — Напоминание психологу перед встречей

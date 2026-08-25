@@ -8,13 +8,15 @@
 
 Основной провайдер — ProxyAPI (OpenAI-совместимый, gpt-4o-mini), тот же ключ и та же
 схема, что в review-monitor. Задача тут простая (вытащить дату/время в JSON), полный
-gpt-4o не нужен. Groq остаётся запасным — переключается через LLM_PROVIDER=groq.
+gpt-4o не нужен. Groq остаётся запасным — переключается через LLM_PROVIDER=groq. К 2026-08-25 Groq
+снял и llama-3.3-70b-versatile, стоявшую тут дефолтом для groq — заменена на
+openai/gpt-oss-120b. Каталог Groq нестабилен, на него нельзя закладываться как на основной.
 """
 from __future__ import annotations
 
 from config import LLM_MODEL, LLM_PROVIDER, PROXYAPI_BASE_URL, PROXYAPI_KEY, GROQ_API_KEY
 
-_DEFAULT_MODELS = {"proxyapi": "gpt-4o-mini", "groq": "llama-3.3-70b-versatile"}
+_DEFAULT_MODELS = {"proxyapi": "gpt-4o-mini", "groq": "openai/gpt-oss-120b"}
 
 PROVIDER = LLM_PROVIDER if LLM_PROVIDER in _DEFAULT_MODELS else "proxyapi"
 MODEL = LLM_MODEL or _DEFAULT_MODELS[PROVIDER]
