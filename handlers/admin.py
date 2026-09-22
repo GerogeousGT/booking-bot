@@ -23,7 +23,9 @@ from database import (
 )
 from services.availability import find_free_slots, find_nearest_free_slots, is_slot_free
 from services.calendar_service import create_event, set_event_meet_url
-from services.date_parser import LLMUnavailable, is_outside_work_hours, parse_user_input
+from services.date_parser import (
+    LLMUnavailable, is_outside_work_hours, parse_user_input, widen_period,
+)
 # Клавиатура ссылки живёт в notifier: одни и те же кнопки в /link и в напоминании
 from services.notifier import link_actions_keyboard
 
@@ -230,8 +232,9 @@ async def _ask_admin_for_time(message: Message, state: FSMContext, hint: str = "
     await message.answer(
         (hint + "\n\n" if hint else "")
         + "На какое время записываем?\n"
-        "Пиши свободно: «завтра в 15», «в субботу в 19:00», «в пятницу утром».\n"
-        "Вне рабочих часов и в выходные — тоже можно, предупрежу.\n\n"
+        "Пиши свободно: «сегодня 20-00», «в субботу в 19:00», «завтра вечером».\n"
+        "Любой час с 7:00 до 22:00, выходные тоже — ограничений нет, "
+        "только помечу выход за расписание.\n\n"
         "Отменить — /cancel"
     )
 
@@ -331,7 +334,7 @@ async def handle_admin_time(message: Message, state: FSMContext):
         result = None
 
     if result is None:
-        slots = find_nearest_free_slots(MAX_ADMIN_SLOTS)
+        slots = find_nearest_free_slots(MAX_ADMIN_SLOTS, unrestricted=True)
         if not slots:
             await message.answer("Не понял время, и свободных слотов рядом нет. Напиши иначе.")
             return
@@ -341,7 +344,8 @@ async def handle_admin_time(message: Message, state: FSMContext):
         return
 
     parsed_dt = result["dt"]
-    period = result["period"]
+    # «вечером» для психолога — это 17-22, а не последний рабочий час клиента
+    period = widen_period(result["period"])
 
     # Точное время: психолог мог договориться на выходной или на вечер — для него
     # сетка рабочих часов не ограничение, в отличие от самозаписи клиента
@@ -355,7 +359,7 @@ async def handle_admin_time(message: Message, state: FSMContext):
             return
 
         if not free:
-            slots = find_free_slots(parsed_dt, None)[:MAX_ADMIN_SLOTS]
+            slots = find_free_slots(parsed_dt, None, unrestricted=True)[:MAX_ADMIN_SLOTS]
             await state.set_state(AdminBookState.waiting_for_slot)
             await message.answer(
                 f"{fmt_slot(parsed_dt)} — занято." +
@@ -370,7 +374,7 @@ async def handle_admin_time(message: Message, state: FSMContext):
         return
 
     try:
-        slots = find_free_slots(parsed_dt, period)[:MAX_ADMIN_SLOTS]
+        slots = find_free_slots(parsed_dt, period, unrestricted=True)[:MAX_ADMIN_SLOTS]
     except Exception as e:
         logger.error(f"Ошибка Calendar API: {e}")
         await message.answer("Не удалось загрузить расписание. Попробуй ещё раз.")
@@ -549,7 +553,7 @@ async def handle_custom_accept(callback: CallbackQuery, state: FSMContext, bot: 
     # Раньше проверки не было — два нестандартных запроса могли лечь на один час
     try:
         if not is_slot_free(slot_start):
-            slots = find_free_slots(slot_start, None)[:MAX_ADMIN_SLOTS]
+            slots = find_free_slots(slot_start, None, unrestricted=True)[:MAX_ADMIN_SLOTS]
             await state.set_state(AdminBookState.waiting_for_slot)
             await callback.message.answer(
                 f"{fmt_slot(slot_start)} уже занято." +

@@ -22,20 +22,24 @@ from services.slot_finder import (
 MOSCOW_TZ = pytz.timezone(TIMEZONE)
 
 
-def find_free_slots(parsed_dt: datetime, period) -> list[datetime]:
-    """Свободные слоты в конкретный день (и период дня, если указан)."""
-    search_start, search_end = build_search_range(parsed_dt, period)
+def find_free_slots(parsed_dt: datetime, period, unrestricted: bool = False) -> list[datetime]:
+    """Свободные слоты в конкретный день (и период дня, если указан).
+
+    `unrestricted=True` — режим психолога: любой день недели, часы 07:00–22:00,
+    без буфера в 2 часа. Клиентская самозапись остаётся в рамках расписания."""
+    search_start, search_end = build_search_range(parsed_dt, period, unrestricted)
     busy = get_busy_slots(search_start, search_end + timedelta(hours=1))
-    candidates = generate_candidate_slots(search_start, search_end, period)
+    candidates = generate_candidate_slots(search_start, search_end, period, unrestricted)
     return filter_free_slots(candidates, busy)
 
 
-def find_nearest_free_slots(limit: int = 5) -> list[datetime]:
+def find_nearest_free_slots(limit: int = 5, unrestricted: bool = False) -> list[datetime]:
     """Ближайшие свободные слоты на весь горизонт записи, без привязки к дню."""
     now = datetime.now(MOSCOW_TZ)
     horizon = now + timedelta(days=SLOTS_DAYS_AHEAD)
     busy = get_busy_slots(now, horizon)
-    candidates = generate_candidate_slots(now + timedelta(hours=MIN_HOURS_BEFORE), horizon)
+    start = now if unrestricted else now + timedelta(hours=MIN_HOURS_BEFORE)
+    candidates = generate_candidate_slots(start, horizon, None, unrestricted)
     return filter_free_slots(candidates, busy)[:limit]
 
 

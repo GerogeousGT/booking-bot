@@ -159,3 +159,52 @@ def test_llm_failure_raises_llm_unavailable(monkeypatch):
 
     with pytest.raises(LLMUnavailable):
         parse_user_input("когда-нибудь на неделе, как получится")
+
+
+# ─── форматы времени, на которых бот спотыкался ─────────────
+
+@pytest.mark.parametrize("text,expected", [
+    ("сегодня 20-00", "20:00"),      # дефис вместо двоеточия — так пишут чаще всего
+    ("сегодня в 20-00", "20:00"),
+    ("сегодня 20:00", "20:00"),
+    ("сегодня 20.00", "20:00"),      # точка: раньше съедалась как дата «20 число»
+    ("сегодня 20", "20:00"),         # голое число без предлога «в»
+    ("завтра 15", "15:00"),
+    ("завтра в 15", "15:00"),
+])
+def test_time_formats_are_understood(text, expected):
+    """Реальный случай: «сегодня 20-00» терялось целиком, и бот уходил в дневную сетку."""
+    out = _fallback_parse(text)
+    assert out is not None and out["time"] == expected, text
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("сегодня в 8 вечера", "20:00"),
+    ("завтра в 3 дня", "15:00"),
+    ("сегодня в 9 утра", "09:00"),   # «сегодня» не должно читаться как «дня» и давать 21:00
+    ("завтра в 10 утра", "10:00"),
+])
+def test_daypart_hints_shift_hour(text, expected):
+    out = _fallback_parse(text)
+    assert out is not None and out["time"] == expected, text
+
+
+def test_date_still_wins_over_time():
+    """«15 июля» — дата, а не 15:00. Голое число не должно это ломать."""
+    out = _fallback_parse("15 июля")
+    assert out["date"].endswith("-07-15")
+    assert out["time"] is None
+
+
+def test_dotted_date_still_parsed_as_date():
+    """«15.08» остаётся датой: второе число — валидный месяц."""
+    out = _fallback_parse("15.08")
+    assert out["date"].endswith("-08-15")
+    assert out["time"] is None
+
+
+def test_admin_evening_is_real_evening():
+    """Для клиента «вечер» = последний рабочий час, для психолога — настоящий вечер."""
+    from services.date_parser import PERIOD_HOURS, widen_period
+    assert widen_period(PERIOD_HOURS["evening"]) == (17, 22)
+    assert widen_period(None) is None

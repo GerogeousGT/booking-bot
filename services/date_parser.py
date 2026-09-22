@@ -38,6 +38,24 @@ PERIOD_HOURS = {
     "evening":   (16, 17),
 }
 
+# Для психолога периоды шире: он не ограничен расписанием приёма, и «вечером»
+# у него означает настоящий вечер, а не последний рабочий час.
+ADMIN_PERIOD_HOURS = {
+    "morning":   (8, 11),
+    "afternoon": (12, 16),
+    "evening":   (17, 22),
+}
+
+
+def widen_period(period: Optional[tuple[int, int]]) -> Optional[tuple[int, int]]:
+    """Переводит клиентский период дня в админский: «вечер» 16-17 → 17-22."""
+    if period is None:
+        return None
+    for name, hours in PERIOD_HOURS.items():
+        if hours == period:
+            return ADMIN_PERIOD_HOURS[name]
+    return period
+
 _last_call: dict[int, float] = {}
 RATE_LIMIT_SEC = 4
 
@@ -85,9 +103,19 @@ _PERIOD_RE = {
 }
 
 # Время: с двоеточием, со словом «час», либо после предлога («в 15», «к 10»).
-_TIME_COLON_RE = re.compile(r"(?<!\d)([01]?\d|2[0-3])[:.]([0-5]\d)(?!\d)")
+# Разделитель часа и минут: двоеточие, точка или дефис — «20:00», «20.00», «20-00».
+# Дефис люди пишут постоянно, а без него время просто терялось.
+_TIME_COLON_RE = re.compile(r"(?<!\d)([01]?\d|2[0-3])\s*[:.\-—]\s*([0-5]\d)(?!\d)")
 _TIME_WORD_RE = re.compile(r"(?<!\d)([01]?\d|2[0-3])\s*час(?:ов|а|у)?\b", re.IGNORECASE)
 _TIME_PREP_RE = re.compile(r"\b(?:в|к|на)\s+([01]?\d|2[0-3])(?!\s*\d)(?!\d)\b", re.IGNORECASE)
+# Голое число без предлога — только когда дата уже определена отдельно («сегодня 20»).
+# Иначе «15 июля» прочиталось бы как 15:00.
+_TIME_BARE_RE = re.compile(r"(?<!\d)([01]?\d|2[0-3])(?!\s*\d)(?!\d)\b")
+
+# «8 вечера» — это 20:00, а не 08:00. Слово рядом с часом сдвигает его в нужную половину суток.
+# \bдня\b обязательно с левой границей — иначе «сегодня» ловится как «дня» и час уезжает на +12
+_PM_HINT_RE = re.compile(r"вечер\w*|ноч\w*|\bдня\b|пополудни", re.IGNORECASE)
+_AM_HINT_RE = re.compile(r"утр\w*", re.IGNORECASE)
 
 
 def detect_period(text: str) -> Optional[tuple[int, int]]:
@@ -101,24 +129,41 @@ def detect_period(text: str) -> Optional[tuple[int, int]]:
     return None
 
 
-def _extract_time(text: str) -> Optional[tuple[int, int]]:
-    """(час, минута) или None. Проверки — от самого однозначного к самому размытому."""
+def _apply_daypart_hint(hour: int, text: str) -> int:
+    """«8 вечера» → 20:00, «9 утра» → 9:00. Без подсказки час не трогаем."""
+    if 1 <= hour <= 11 and _PM_HINT_RE.search(text):
+        return hour + 12
+    if hour == 12 and _AM_HINT_RE.search(text):
+        return 0
+    return hour
+
+
+def _extract_time(text: str, allow_bare: bool = False) -> Optional[tuple[int, int]]:
+    """(час, минута) или None. Проверки — от самого однозначного к самому размытому.
+
+    `allow_bare` включается только когда дата уже определена отдельно: тогда
+    оставшееся в тексте число — это час («сегодня 20»), а не день месяца."""
     m = _TIME_COLON_RE.search(text)
     if m:
-        return int(m.group(1)), int(m.group(2))
+        return _apply_daypart_hint(int(m.group(1)), text), int(m.group(2))
     m = _TIME_WORD_RE.search(text)
     if m:
-        return int(m.group(1)), 0
+        return _apply_daypart_hint(int(m.group(1)), text), 0
     m = _TIME_PREP_RE.search(text)
     if m:
-        return int(m.group(1)), 0
+        return _apply_daypart_hint(int(m.group(1)), text), 0
+    if allow_bare:
+        m = _TIME_BARE_RE.search(text)
+        if m:
+            return _apply_daypart_hint(int(m.group(1)), text), 0
     return None
 
 
 def _strip_dates(text: str) -> str:
     """Убирает фрагменты-даты, чтобы «15 июля» не было прочитано как «15:00»."""
     t = re.sub(rf"\b\d{{1,2}}\s*{_MONTH_RE}\w*", " ", text, flags=re.IGNORECASE)
-    t = re.sub(r"\b\d{1,2}\.\d{1,2}(?:\.\d{2,4})?\b", " ", t)
+    # Только если второе число — валидный месяц: «15.08» это дата, а «20.00» — время
+    t = re.sub(r"\b\d{1,2}\.(?:0?[1-9]|1[0-2])(?:\.\d{2,4})?\b", " ", t)
     t = re.sub(r"\b\d{1,2}\s*(?:числа|го)\b", " ", t, flags=re.IGNORECASE)
     return t
 
@@ -197,7 +242,9 @@ def _fallback_parse(text: str) -> Optional[dict]:
 
     # ── время и период (по тексту без дат, чтобы не спутать «15 июля» с «15:00») ──
     rest = _strip_dates(low)
-    hm = _extract_time(rest)
+    # Дата уже определена выше, значит оставшееся число — это час: «сегодня 20-00»,
+    # «завтра 15». Без этого время без предлога «в» просто терялось.
+    hm = _extract_time(rest, allow_bare=True)
     if hm:
         out["time"] = f"{hm[0]:02d}:{hm[1]:02d}"
     else:
