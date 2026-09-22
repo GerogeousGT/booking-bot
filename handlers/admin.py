@@ -411,6 +411,16 @@ async def handle_admin_slot(callback: CallbackQuery, state: FSMContext, bot: Bot
     except Exception as e:
         logger.warning(f"Не удалось проверить занятость перед созданием: {e}")
 
+    # Перенос: старую запись снимаем тихо — клиент получит одно сообщение
+    # «перенесена с ... на ...», а не «отменена» следом за «записаны»
+    moved_from = None
+    move_from_id = data.get("move_from_id")
+    if move_from_id:
+        old = await get_booking(move_from_id)
+        if old and old["status"] == "confirmed":
+            moved_from = datetime.fromisoformat(old["slot_start"]).astimezone(MOSCOW_TZ)
+            await _release_booking(old)
+
     await _create_booking_by_admin(
         bot=bot,
         admin_message=callback.message,
@@ -419,17 +429,22 @@ async def handle_admin_slot(callback: CallbackQuery, state: FSMContext, bot: Bot
         contact=data["contact"],
         slot_start=slot_start,
         pending_id=data.get("pending_id"),
+        moved_from=moved_from,
     )
     await callback.answer()
 
 
 async def _create_booking_by_admin(bot: Bot, admin_message: Message, client_id: int,
                                    name: str, contact: str, slot_start: datetime,
-                                   pending_id: int | None) -> None:
+                                   pending_id: int | None,
+                                   moved_from: datetime | None = None) -> None:
     """Ядро: создаёт запись от лица психолога и уведомляет клиента.
 
-    Общее для /add и для карточки нестандартного запроса — чтобы договорённость
-    в любом случае попала в календарь и получила напоминания."""
+    Общее для /add, карточки нестандартного запроса и переноса — чтобы
+    договорённость в любом случае попала в календарь и получила напоминания.
+
+    `moved_from` — старое время при переносе: клиент получит одно понятное
+    «перенесена с ... на ...» вместо пары «отменена» + «записаны»."""
     slot_end = slot_start + timedelta(minutes=SLOT_DURATION_MIN)
     meet_url = await get_client_meet_url(client_id)
 
@@ -454,21 +469,39 @@ async def _create_booking_by_admin(bot: Bot, admin_message: Message, client_id: 
         f"Подключайтесь по ссылке к началу:\n{meet_url}\n\n" if meet_url
         else "Ссылку на видеовстречу пришлю сюда за 10–15 минут до начала.\n\n"
     )
-    delivered = await _notify_client(
-        bot, client_id,
-        f"✅ Вы записаны на консультацию\n\n"
-        f"Время: {fmt_slot(slot_start)}\n"
-        f"{link_line}"
-        f"Пришлю напоминание за сутки и за час до начала.\n"
-        f"Чтобы отменить — /cancel",
-    )
+    if moved_from:
+        client_text = (
+            f"🔄 Ваша запись перенесена\n\n"
+            f"Было: {fmt_slot(moved_from)}\n"
+            f"Стало: {fmt_slot(slot_start)}\n\n"
+            f"{link_line}"
+            f"Пришлю напоминание за сутки и за час до начала.\n"
+            f"Чтобы отменить — /cancel"
+        )
+    else:
+        client_text = (
+            f"✅ Вы записаны на консультацию\n\n"
+            f"Время: {fmt_slot(slot_start)}\n"
+            f"{link_line}"
+            f"Пришлю напоминание за сутки и за час до начала.\n"
+            f"Чтобы отменить — /cancel"
+        )
+    delivered = await _notify_client(bot, client_id, client_text)
 
     status = "уведомление отправлено" if delivered else "⚠️ клиент недоступен (мог заблокировать бота)"
-    await admin_message.answer(
+    head = (
+        f"🔄 Запись перенесена #{booking_id}\n"
+        f"Клиент: {name} ({contact})\n"
+        f"Было: {fmt_slot(moved_from)}\n"
+        f"Стало: {fmt_slot(slot_start)}\n"
+        if moved_from else
         f"✅ Запись создана #{booking_id}\n"
         f"Клиент: {name} ({contact})\n"
         f"Время: {fmt_slot(slot_start)}\n"
-        f"{status}"
+    )
+    await admin_message.answer(
+        head
+        + f"{status}"
         + ("" if meet_url else "\n\nСсылки у клиента ещё нет — можно приложить сразу:"),
         reply_markup=link_actions_keyboard(booking_id, bool(meet_url)),
     )
@@ -516,6 +549,7 @@ def _booking_card(booking) -> str:
 
 def booking_actions_keyboard(booking_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Перенести", callback_data=f"amove:{booking_id}")],
         [InlineKeyboardButton(text="❌ Отменить запись", callback_data=f"adel:{booking_id}")],
     ])
 
@@ -530,6 +564,33 @@ def booking_actions_keyboard(booking_id: int) -> InlineKeyboardMarkup:
 
 class AdminCancelState(StatesGroup):
     waiting_for_reason = State()
+
+
+@router.callback_query(F.data.startswith("amove:"))
+async def handle_admin_move(callback: CallbackQuery, state: FSMContext):
+    """Перенос: тот же выбор времени, что в /add, но старая запись снимается,
+    а клиенту уходит одно сообщение «перенесена с ... на ...», а не два."""
+    if callback.from_user.id != ADMIN_TELEGRAM_ID:
+        await callback.answer()
+        return
+
+    booking_id = int(callback.data.split(":", 1)[1])
+    booking = await get_booking(booking_id)
+    if not booking or booking["status"] != "confirmed":
+        await callback.answer("Записи уже нет — возможно, её отменили.", show_alert=True)
+        return
+
+    slot_start = datetime.fromisoformat(booking["slot_start"]).astimezone(MOSCOW_TZ)
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await state.update_data(
+        client_id=booking["telegram_id"], name=booking["name"],
+        contact=booking["contact"], pending_id=None, move_from_id=booking_id,
+    )
+    await _ask_admin_for_time(
+        callback.message, state,
+        hint=f"Переносим: {booking['name']}\nСейчас записан(а) на {fmt_slot(slot_start)}",
+    )
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("adel:"))
@@ -553,10 +614,14 @@ async def handle_admin_cancel_ask(callback: CallbackQuery):
         f"{fmt_slot(slot_start)}\n\n"
         f"Клиент получит уведомление об отмене.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Отменить без комментария",
+            [InlineKeyboardButton(text="✅ Отменить и уведомить",
                                   callback_data=f"adelok:{booking_id}")],
             [InlineKeyboardButton(text="💬 Отменить и написать причину",
                                   callback_data=f"adelmsg:{booking_id}")],
+            # Для случаев, когда об отмене уже договорились голосом: лишнее
+            # сообщение от бота только путает клиента
+            [InlineKeyboardButton(text="🔇 Отменить тихо, без уведомления",
+                                  callback_data=f"adelq:{booking_id}")],
             [InlineKeyboardButton(text="↩ Не отменять", callback_data="adelno")],
         ]),
     )
@@ -602,30 +667,47 @@ async def handle_admin_cancel_reason(message: Message, state: FSMContext, bot: B
 
 
 @router.callback_query(F.data.startswith("adelok:"))
+@router.callback_query(F.data.startswith("adelq:"))
 async def handle_admin_cancel_confirm(callback: CallbackQuery, bot: Bot):
     if callback.from_user.id != ADMIN_TELEGRAM_ID:
         await callback.answer()
         return
 
-    booking_id = int(callback.data.split(":", 1)[1])
+    action, raw_id = callback.data.split(":", 1)
     await callback.message.edit_reply_markup(reply_markup=None)
-    await _cancel_booking_by_admin(bot, callback.message, booking_id, reason="")
+    await _cancel_booking_by_admin(bot, callback.message, int(raw_id), reason="",
+                                   notify=(action == "adelok"))
     await callback.answer()
 
 
-async def _cancel_booking_by_admin(bot: Bot, admin_message: Message,
-                                   booking_id: int, reason: str) -> None:
+async def _release_booking(booking) -> None:
+    """Снимает запись: освобождает слот в календаре и помечает cancelled.
+
+    Календарь первым — слот должен освободиться, даже если дальше что-то упадёт."""
+    if booking["google_event_id"]:
+        delete_event(booking["google_event_id"])
+    await cancel_booking(booking["id"])
+
+
+async def _cancel_booking_by_admin(bot: Bot, admin_message: Message, booking_id: int,
+                                   reason: str, notify: bool = True) -> None:
     booking = await get_booking(booking_id)
     if not booking or booking["status"] != "confirmed":
         await admin_message.answer("Записи уже нет — возможно, её отменили.")
         return
 
     slot_start = datetime.fromisoformat(booking["slot_start"]).astimezone(MOSCOW_TZ)
+    await _release_booking(booking)
 
-    # Сначала календарь: слот должен освободиться, даже если дальше что-то упадёт
-    if booking["google_event_id"]:
-        delete_event(booking["google_event_id"])
-    await cancel_booking(booking_id)
+    head = (
+        f"✅ Запись #{booking_id} отменена\n"
+        f"{booking['name']} — {fmt_slot(slot_start)}\n"
+        f"Слот в календаре освобождён.\n"
+    )
+
+    if not notify:
+        await admin_message.answer(head + "🔇 Клиенту ничего не отправлено.")
+        return
 
     text = (
         f"❌ Ваша запись отменена\n\n"
@@ -635,14 +717,10 @@ async def _cancel_booking_by_admin(bot: Bot, admin_message: Message,
     text += "Записаться на другое время можно кнопкой «Записаться» в меню."
 
     delivered = await _notify_client(bot, booking["telegram_id"], text)
-
     await admin_message.answer(
-        f"✅ Запись #{booking_id} отменена\n"
-        f"{booking['name']} — {fmt_slot(slot_start)}\n"
-        f"Слот в календаре освобождён.\n"
-        + ("Клиент уведомлён." if delivered
-           else f"⚠️ Уведомление не дошло — клиент мог заблокировать бота. "
-                f"Свяжись напрямую: {booking['contact']}")
+        head + ("Клиент уведомлён." if delivered
+                else f"⚠️ Уведомление не дошло — клиент мог заблокировать бота. "
+                     f"Свяжись напрямую: {booking['contact']}")
     )
 
 
