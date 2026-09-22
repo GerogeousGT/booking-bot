@@ -187,3 +187,79 @@ def test_move_keeps_client_link(tmp_path, monkeypatch):
         assert await db.get_client_meet_url(111) == url
 
     asyncio.run(scenario())
+
+
+def test_move_resets_reminder_flags(tmp_path, monkeypatch):
+    """Ключевое при переносе: по старой записи напоминания уже ушли (флаги=1).
+    Новая запись должна получить чистые флаги, иначе клиент не узнает о новом
+    времени — напоминания будут считаться отправленными."""
+    db = _fresh_db(tmp_path, monkeypatch)
+
+    async def scenario():
+        await db.init_db()
+        now = datetime.now(MOSCOW_TZ)
+        old_start = now + timedelta(hours=1)
+        new_start = now + timedelta(days=2)
+
+        old_id = await db.create_booking(
+            telegram_id=111, name="Тест", contact="@test",
+            slot_start=old_start.isoformat(),
+            slot_end=(old_start + timedelta(minutes=55)).isoformat(),
+            google_event_id="ev_old", meet_url="https://x.ru/1",
+            created_at=now.isoformat(),
+        )
+        # по старой записи всё уже разослано
+        for kind in ("24h", "1h", "5min"):
+            await db.mark_reminder_sent(old_id, kind)
+        await db.mark_link_prompt_sent(old_id, "prompt")
+
+        old = await db.get_booking(old_id)
+        assert old["reminder_24h_sent"] == 1 and old["reminder_5min_sent"] == 1
+
+        await db.cancel_booking(old_id)
+        new_id = await db.create_booking(
+            telegram_id=111, name="Тест", contact="@test",
+            slot_start=new_start.isoformat(),
+            slot_end=(new_start + timedelta(minutes=55)).isoformat(),
+            google_event_id="ev_new", meet_url="https://x.ru/1",
+            created_at=now.isoformat(),
+        )
+
+        new = await db.get_booking(new_id)
+        assert new["reminder_24h_sent"] == 0
+        assert new["reminder_1h_sent"] == 0
+        assert new["reminder_5min_sent"] == 0
+        assert new["admin_link_prompt_sent"] == 0, "психолога тоже надо пнуть по новому времени"
+
+        # и новая запись реально стоит в очереди на напоминания
+        pending = await db.get_pending_reminders()
+        assert [b["id"] for b in pending] == [new_id]
+
+    asyncio.run(scenario())
+
+
+def test_reminder_windows_apply_to_new_time(tmp_path, monkeypatch):
+    """Напоминания считаются от нового времени, а не от старого."""
+    import services.notifier as notifier
+    db = _fresh_db(tmp_path, monkeypatch)
+
+    async def scenario():
+        await db.init_db()
+        now = datetime.now(MOSCOW_TZ)
+        new_start = now + timedelta(days=2)
+        new_id = await db.create_booking(
+            telegram_id=111, name="Тест", contact="@test",
+            slot_start=new_start.isoformat(),
+            slot_end=(new_start + timedelta(minutes=55)).isoformat(),
+            google_event_id="ev_new", meet_url="https://x.ru/1",
+            created_at=now.isoformat(),
+        )
+        b = (await db.get_pending_reminders())[0]
+        slot_start = datetime.fromisoformat(b["slot_start"]).astimezone(MOSCOW_TZ)
+        delta = slot_start - now
+
+        # до встречи двое суток: окно «за 24 часа» (23-25ч) ещё впереди
+        assert delta > timedelta(hours=25)
+        assert b["id"] == new_id
+
+    asyncio.run(scenario())
