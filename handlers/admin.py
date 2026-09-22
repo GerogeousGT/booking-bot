@@ -17,12 +17,13 @@ from aiogram.types import (
 
 from config import ADMIN_TELEGRAM_ID, TIMEZONE, SLOT_DURATION_MIN
 from database import (
-    create_booking, get_booking, get_bookable_people, get_client_meet_url, get_person,
+    cancel_booking, create_booking, get_booking, get_bookable_people, get_client_meet_url,
+    get_person,
     get_upcoming_bookings, set_booking_meet_url, set_client_meet_url, upsert_client,
     get_pending_custom, delete_pending_custom,
 )
 from services.availability import find_free_slots, find_nearest_free_slots, is_slot_free
-from services.calendar_service import create_event, set_event_meet_url
+from services.calendar_service import create_event, delete_event, set_event_meet_url
 from services.date_parser import (
     LLMUnavailable, is_outside_work_hours, parse_user_input, widen_period,
 )
@@ -498,12 +499,151 @@ async def cmd_bookings(message: Message):
         await message.answer("Предстоящих записей нет.")
         return
 
-    lines = ["📋 Предстоящие записи:\n"]
+    await message.answer("📋 Предстоящие записи:")
     for b in bookings:
-        slot_start = datetime.fromisoformat(b["slot_start"]).astimezone(MOSCOW_TZ)
-        lines.append(f"• {fmt_slot(slot_start)} — {b['name']} ({b['contact']}) #{b['id']}")
+        await message.answer(_booking_card(b), reply_markup=booking_actions_keyboard(b["id"]))
 
-    await message.answer("\n".join(lines))
+
+def _booking_card(booking) -> str:
+    slot_start = datetime.fromisoformat(booking["slot_start"]).astimezone(MOSCOW_TZ)
+    link = booking["meet_url"] or ""
+    return (
+        f"#{booking['id']} — {booking['name']} ({booking['contact']})\n"
+        f"{fmt_slot(slot_start)}\n"
+        + (f"Ссылка: {link}" if link else "⚠️ Ссылки нет")
+    )
+
+
+def booking_actions_keyboard(booking_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отменить запись", callback_data=f"adel:{booking_id}")],
+    ])
+
+
+# ─────────────────────── отмена записи психологом ────────────────────────
+#
+# Клиент может отменить только свою запись — в его хендлере стоит проверка
+# telegram_id. Психологу нужен свой путь: договорились об отмене голосом, и если
+# он не пройдёт через бота, событие останется в календаре, а клиенту придут
+# напоминания о встрече, которой не будет.
+
+
+class AdminCancelState(StatesGroup):
+    waiting_for_reason = State()
+
+
+@router.callback_query(F.data.startswith("adel:"))
+async def handle_admin_cancel_ask(callback: CallbackQuery):
+    """Подтверждение: отмена сносит чужую встречу, промах пальцем недопустим."""
+    if callback.from_user.id != ADMIN_TELEGRAM_ID:
+        await callback.answer()
+        return
+
+    booking_id = int(callback.data.split(":", 1)[1])
+    booking = await get_booking(booking_id)
+    if not booking or booking["status"] != "confirmed":
+        await callback.answer("Записи уже нет — возможно, её отменили.", show_alert=True)
+        return
+
+    slot_start = datetime.fromisoformat(booking["slot_start"]).astimezone(MOSCOW_TZ)
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer(
+        f"Отменить запись?\n\n"
+        f"{booking['name']} ({booking['contact']})\n"
+        f"{fmt_slot(slot_start)}\n\n"
+        f"Клиент получит уведомление об отмене.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Отменить без комментария",
+                                  callback_data=f"adelok:{booking_id}")],
+            [InlineKeyboardButton(text="💬 Отменить и написать причину",
+                                  callback_data=f"adelmsg:{booking_id}")],
+            [InlineKeyboardButton(text="↩ Не отменять", callback_data="adelno")],
+        ]),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "adelno")
+async def handle_admin_cancel_abort(callback: CallbackQuery):
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer("Запись оставлена без изменений.")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adelmsg:"))
+async def handle_admin_cancel_with_reason(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_TELEGRAM_ID:
+        await callback.answer()
+        return
+
+    booking_id = int(callback.data.split(":", 1)[1])
+    await state.set_state(AdminCancelState.waiting_for_reason)
+    await state.update_data(booking_id=booking_id)
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer(
+        "Напиши, что передать клиенту вместе с отменой.\n\n"
+        "Отменить действие — /cancel"
+    )
+    await callback.answer()
+
+
+@router.message(AdminCancelState.waiting_for_reason, F.text.in_({"/cancel", "отмена", "Отмена"}))
+async def handle_admin_cancel_reason_abort(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Запись оставлена без изменений.")
+
+
+@router.message(AdminCancelState.waiting_for_reason)
+async def handle_admin_cancel_reason(message: Message, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    await state.clear()
+    await _cancel_booking_by_admin(bot, message, data["booking_id"],
+                                   reason=(message.text or "").strip())
+
+
+@router.callback_query(F.data.startswith("adelok:"))
+async def handle_admin_cancel_confirm(callback: CallbackQuery, bot: Bot):
+    if callback.from_user.id != ADMIN_TELEGRAM_ID:
+        await callback.answer()
+        return
+
+    booking_id = int(callback.data.split(":", 1)[1])
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await _cancel_booking_by_admin(bot, callback.message, booking_id, reason="")
+    await callback.answer()
+
+
+async def _cancel_booking_by_admin(bot: Bot, admin_message: Message,
+                                   booking_id: int, reason: str) -> None:
+    booking = await get_booking(booking_id)
+    if not booking or booking["status"] != "confirmed":
+        await admin_message.answer("Записи уже нет — возможно, её отменили.")
+        return
+
+    slot_start = datetime.fromisoformat(booking["slot_start"]).astimezone(MOSCOW_TZ)
+
+    # Сначала календарь: слот должен освободиться, даже если дальше что-то упадёт
+    if booking["google_event_id"]:
+        delete_event(booking["google_event_id"])
+    await cancel_booking(booking_id)
+
+    text = (
+        f"❌ Ваша запись отменена\n\n"
+        f"Время: {fmt_slot(slot_start)}\n\n"
+    )
+    text += f"{reason}\n\n" if reason else "Георгий свяжется с вами, чтобы согласовать другое время.\n\n"
+    text += "Записаться на другое время можно кнопкой «Записаться» в меню."
+
+    delivered = await _notify_client(bot, booking["telegram_id"], text)
+
+    await admin_message.answer(
+        f"✅ Запись #{booking_id} отменена\n"
+        f"{booking['name']} — {fmt_slot(slot_start)}\n"
+        f"Слот в календаре освобождён.\n"
+        + ("Клиент уведомлён." if delivered
+           else f"⚠️ Уведомление не дошло — клиент мог заблокировать бота. "
+                f"Свяжись напрямую: {booking['contact']}")
+    )
 
 
 # ─────────────────────── нестандартное время ────────────────────────
@@ -607,6 +747,9 @@ async def handle_custom_decline(callback: CallbackQuery, bot: Bot):
 
 # ─────────────────────── умный хендлер для психолога ────────────────────────
 
+# Намерение отменить, а не посмотреть: ведёт к карточкам с кнопкой отмены
+_ADMIN_CANCEL_RE = re.compile(r"отмен|удал|снят|снести|убра", re.IGNORECASE)
+
 _BOOKINGS_RE = re.compile(
     r"запис|расписан|клиент|сессия|сеанс|что.{0,10}(сегодня|завтра|неделе|есть)|"
     r"у меня|свободн|занят|покажи|список|schedule",
@@ -633,6 +776,17 @@ async def admin_smart_bookings(message: Message):
     text = message.text.strip()
     now = datetime.now(MOSCOW_TZ)
     bookings = await get_upcoming_bookings()
+
+    # «отмени запись» — это намерение действовать, а не посмотреть список.
+    # Показываем карточки с кнопкой отмены вместо простого перечисления.
+    if _ADMIN_CANCEL_RE.search(text):
+        if not bookings:
+            await message.answer("Предстоящих записей нет.")
+            return
+        await message.answer("Какую запись отменить?")
+        for b in bookings:
+            await message.answer(_booking_card(b), reply_markup=booking_actions_keyboard(b["id"]))
+        return
 
     # Пытаемся понять временной контекст
     result = parse_user_input(text, user_id=0)
