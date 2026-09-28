@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 
 import pytz
 
-from handlers.admin import _ADMIN_CANCEL_RE, booking_actions_keyboard
+from handlers.admin import _ADMIN_ACTION_RE, _BOOKINGS_RE, booking_actions_keyboard
 
 MOSCOW_TZ = pytz.timezone("Europe/Moscow")
 
@@ -27,13 +27,13 @@ def _fresh_db(tmp_path, monkeypatch):
 def test_cancel_intent_recognised():
     for phrase in ["отменить запись", "отмени запись Лизы", "удали запись #9",
                    "снять запись на завтра", "убрать запись"]:
-        assert _ADMIN_CANCEL_RE.search(phrase), phrase
+        assert _ADMIN_ACTION_RE.search(phrase), phrase
 
 
 def test_plain_schedule_question_is_not_cancel():
     """«что у меня завтра» — это просмотр, кнопки отмены показывать не надо."""
     for phrase in ["что у меня завтра", "покажи записи", "клиенты на этой неделе"]:
-        assert not _ADMIN_CANCEL_RE.search(phrase), phrase
+        assert not _ADMIN_ACTION_RE.search(phrase), phrase
 
 
 def test_card_offers_move_and_cancel():
@@ -263,3 +263,28 @@ def test_reminder_windows_apply_to_new_time(tmp_path, monkeypatch):
         assert b["id"] == new_id
 
     asyncio.run(scenario())
+
+
+# ─── маршрутизация текстовых команд психолога ───────────────
+
+def test_move_intent_reaches_cards():
+    """Реальный баг: «перенести запись» показывало список текстом без кнопок —
+    слова «перенес» не было в регекспе действий, до карточек было не добраться."""
+    for phrase in ["перенести запись", "перенеси Лизу на завтра", "сдвинуть запись",
+                   "подвинуть запись", "перенос записи"]:
+        assert _ADMIN_ACTION_RE.search(phrase), phrase
+        assert _BOOKINGS_RE.search(phrase), f"{phrase} не дойдёт до админского хендлера"
+
+
+def test_bare_move_word_reaches_admin_handler():
+    """Голое «перенести» без слова «запись» проваливалось в клиентский /cancel
+    и отвечало «у вас нет активных записей»."""
+    assert _BOOKINGS_RE.search("перенести")
+    assert _ADMIN_ACTION_RE.search("перенести")
+
+
+def test_schedule_questions_still_show_plain_list():
+    """Просмотр расписания не должен превращаться в кнопки действий."""
+    for phrase in ["что у меня завтра", "покажи записи", "клиенты на этой неделе",
+                   "есть ли кто в пятницу", "расписание на неделю"]:
+        assert not _ADMIN_ACTION_RE.search(phrase), phrase

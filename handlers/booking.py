@@ -849,6 +849,14 @@ async def cmd_my_bookings(message: Message):
 async def cmd_cancel(message: Message):
     bookings = await get_user_bookings(message.from_user.id)
     if not bookings:
+        # Психолог почти наверняка имел в виду записи клиентов, а не свои: ответ
+        # «у вас нет активных записей» выглядел как поломка бота
+        if message.from_user.id == ADMIN_TELEGRAM_ID:
+            await message.answer(
+                "Своих записей у вас нет.\n\n"
+                "Чтобы работать с записями клиентов — /bookings"
+            )
+            return
         await message.answer("У вас нет активных записей.")
         return
 
